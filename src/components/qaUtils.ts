@@ -1,8 +1,19 @@
 import JSZip from 'jszip';
-import { inflate, inflateRaw } from 'pako';
 import { readPsd, initializeCanvas } from 'ag-psd';
 import type { Layer, Psd } from 'ag-psd';
 import wordsText from '../assets/dictionary/en_words.txt?raw';
+import {
+  AiParseError,
+  extractAiXmpThumbnail,
+  extractTextFromPdfBuffer,
+  processAiDocument,
+} from './aiUtils';
+import { isMagentaColor, scanCanvasForMagenta } from './colorUtils';
+import { analyzeQrCodes } from './qrUtils';
+import type { QrScanOutcome } from './qrUtils';
+
+export type { QrLinkResult, QrScanOutcome, LinkStatus } from './qrUtils';
+export { resetLinkCache } from './qrUtils';
 
 // Initialize canvas implementation for ag-psd if in browser
 if (typeof document !== 'undefined') {
@@ -51,18 +62,43 @@ export interface SpellingIssue {
   context: string;
 }
 
+/** Where an analysed asset came from — drives which QA columns are relevant. */
+export type AssetSource = 'image' | 'psd' | 'ai';
+
+/**
+ * Result of the "Default Values" check: has any text on this artboard been left
+ * in the magenta (#FF00FF) placeholder colour?
+ */
+export interface DefaultValueCheck {
+  hasMagentaText: boolean;
+  /** The offending copy, so the reviewer knows what still needs localising. */
+  samples: string[];
+  /** How the verdict was reached. */
+  method: 'layer' | 'vector' | 'pixel' | 'none';
+}
+
 export interface ImageAnalysis {
   id: string;
   fileName: string;
   previewUrl: string;
+  sourceType: AssetSource;
   metadata: ImageMetadata;
   ocrResult: OCRResult;
   spellingIssues: SpellingIssue[];
   status: 'pass' | 'flagged' | 'no-text';
+  /** QR codes found on the artboard and the verdict on each link. */
+  qr: QrScanOutcome;
+  defaultValues: DefaultValueCheck;
 }
 
+const EMPTY_DEFAULT_VALUES: DefaultValueCheck = {
+  hasMagentaText: false,
+  samples: [],
+  method: 'none',
+};
+
 export interface ProcessingProgress {
-  stage: 'reading' | 'metadata' | 'ocr' | 'spelling' | 'complete';
+  stage: 'reading' | 'metadata' | 'ocr' | 'spelling' | 'qr' | 'complete';
   stageLabel: string;
   current: number;
   total: number;
@@ -509,6 +545,38 @@ export function checkSpelling(text: string): SpellingIssue[] {
 }
 
 // ============================================
+// Supported inputs
+// ============================================
+
+/** Every asset extension the QA module can analyse. */
+export const SUPPORTED_EXTENSIONS = [
+  '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif',
+  '.psd', '.ai',
+];
+
+/** Lower-cased extension including the leading dot, or '' when there is none. */
+export function fileExtension(name: string): string {
+  const idx = name.lastIndexOf('.');
+  return idx === -1 ? '' : name.slice(idx).toLowerCase();
+}
+
+export function isPsdFile(name: string): boolean {
+  return fileExtension(name) === '.psd';
+}
+
+export function isAiFile(name: string): boolean {
+  return fileExtension(name) === '.ai';
+}
+
+export function isZipFile(name: string): boolean {
+  return fileExtension(name) === '.zip';
+}
+
+export function isSupportedAsset(name: string): boolean {
+  return SUPPORTED_EXTENSIONS.includes(fileExtension(name));
+}
+
+// ============================================
 // ZIP Processing
 // ============================================
 
@@ -526,7 +594,6 @@ export async function processZipFile(zipFile: File): Promise<ExtractedImage[]> {
   const arrayBuffer = await zipFile.arrayBuffer();
   const zip = await JSZip.loadAsync(arrayBuffer);
 
-  const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.psd'];
   const images: ExtractedImage[] = [];
 
   const entries = Object.entries(zip.files);
@@ -536,8 +603,8 @@ export async function processZipFile(zipFile: File): Promise<ExtractedImage[]> {
     if (zipEntry.dir) continue;
     if (path.startsWith('__MACOSX') || path.startsWith('.')) continue;
 
-    const ext = '.' + path.split('.').pop()?.toLowerCase();
-    if (!imageExtensions.includes(ext)) continue;
+    const ext = fileExtension(path);
+    if (!SUPPORTED_EXTENSIONS.includes(ext)) continue;
 
     const blob = await zipEntry.async('blob');
     const fileName = path.split('/').pop() || path;
@@ -549,6 +616,7 @@ export async function processZipFile(zipFile: File): Promise<ExtractedImage[]> {
       '.webp': 'image/webp', '.bmp': 'image/bmp',
       '.tiff': 'image/tiff', '.tif': 'image/tiff',
       '.psd': 'image/vnd.adobe.photoshop',
+      '.ai': 'application/illustrator',
     };
     const mime = mimeMap[ext] || 'image/jpeg';
 
@@ -598,6 +666,19 @@ export async function analyzeImage(
   onProgress?.('Checking spelling...');
   const spellingIssues = checkSpelling(ocrResult.text);
 
+  // 4. QR codes — a flat raster has no vector data, so a single whole-frame
+  //    sweep is enough; the thorough tile sweep is reserved for AI artboards.
+  onProgress?.('Scanning for QR codes...');
+  let qr: QrScanOutcome = { scanned: false, links: [] };
+  try {
+    qr = await analyzeQrCodes(img);
+  } catch (err) {
+    console.warn('QR scan failed for', file.name, err);
+  }
+
+  // 5. Default values — no layer data on a raster, so sample rendered pixels.
+  const defaultValues = detectMagentaInImage(img);
+
   // Determine status
   let status: ImageAnalysis['status'] = 'pass';
   if (!ocrResult.text || ocrResult.text.trim().length === 0) {
@@ -610,11 +691,44 @@ export async function analyzeImage(
     id,
     fileName: file.name,
     previewUrl,
+    sourceType: 'image',
     metadata,
     ocrResult,
     spellingIssues,
     status,
+    qr,
+    defaultValues,
   };
+}
+
+/**
+ * Pixel fallback for the "Default Values" check on assets that carry no
+ * structured text colour (flat JPEG/PNG deliverables).
+ */
+function detectMagentaInImage(img: HTMLImageElement): DefaultValueCheck {
+  try {
+    const maxEdge = Math.max(img.naturalWidth, img.naturalHeight);
+    if (maxEdge === 0) return EMPTY_DEFAULT_VALUES;
+
+    // Cap the sample surface — spotting a colour does not need full resolution,
+    // and a large deliverable would otherwise pin tens of megabytes per asset.
+    const scale = Math.min(1, 1600 / maxEdge);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return EMPTY_DEFAULT_VALUES;
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    const result = scanCanvasForMagenta(canvas);
+    return result.found
+      ? { hasMagentaText: true, samples: [], method: 'pixel' }
+      : EMPTY_DEFAULT_VALUES;
+  } catch (err) {
+    console.warn('Magenta pixel scan failed:', err);
+    return EMPTY_DEFAULT_VALUES;
+  }
 }
 
 // ============================================
@@ -629,103 +743,65 @@ interface ArtboardInfo {
   children: Layer[];
 }
 
-/**
- * Unescape standard PDF string escapes
- */
-function unescapePdfString(s: string): string {
-  return s
-    .replace(/\\\\/g, '\\')
-    .replace(/\\([()])/g, '$1')
-    .replace(/\\n/g, '\n')
-    .replace(/\\r/g, '\r')
-    .replace(/\\t/g, '\t');
+/** Text pulled out of a PSD layer tree, split by whether it is placeholder copy. */
+interface LayerTextHarvest {
+  texts: string[];
+  magentaTexts: string[];
 }
 
 /**
- * Extract vector marketing text from embedded Illustrator (.ai) / PDF smart objects.
- * Decompresses stream contents with pako and parses BT...ET content stream operators.
+ * Collect the magenta-coloured runs of a native Photoshop text layer.
+ *
+ * Photoshop stores a base style plus optional per-range style runs, so a single
+ * text layer can mix localised copy with an untouched magenta placeholder. We
+ * walk the runs to return only the offending substrings.
  */
-function extractTextFromPdfBuffer(data: Uint8Array): string[] {
-  const str = new TextDecoder('latin1').decode(data);
-  const streamRegex = /\/Length\s+(\d+)[\s\S]*?stream[\r\n]+/g;
-  let match: RegExpExecArray | null;
-  const texts: string[] = [];
+function magentaTextFromPsdLayer(layer: Layer): string[] {
+  const data = layer.text;
+  if (!data || typeof data.text !== 'string') return [];
 
-  while ((match = streamRegex.exec(str)) !== null) {
-    const length = parseInt(match[1], 10);
-    if (!length || length <= 0 || length > 20000000) continue;
+  const full = data.text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const baseFill = data.style?.fillColor;
+  const runs = data.styleRuns;
+  const out: string[] = [];
 
-    const streamStart = match.index + match[0].length;
-    const slice = data.subarray(streamStart, streamStart + length);
+  if (runs && runs.length > 0) {
+    let offset = 0;
+    for (const run of runs) {
+      const length = run.length ?? 0;
+      const slice = full.slice(offset, offset + length);
+      offset += length;
 
-    let decompressedStr = '';
-    try {
-      const dec = inflate(slice);
-      decompressedStr = new TextDecoder('latin1').decode(dec);
-    } catch {
-      try {
-        const dec = inflateRaw(slice);
-        decompressedStr = new TextDecoder('latin1').decode(dec);
-      } catch {
-        try {
-          decompressedStr = new TextDecoder('latin1').decode(slice);
-        } catch {}
+      const fill = run.style?.fillColor ?? baseFill;
+      if (fill && isMagentaColor(fill)) {
+        const trimmed = slice.trim();
+        if (trimmed.length > 0) out.push(trimmed);
       }
     }
-
-    if (decompressedStr && decompressedStr.includes('BT')) {
-      const btRegex = /BT([\s\S]*?)ET/g;
-      let btMatch: RegExpExecArray | null;
-      while ((btMatch = btRegex.exec(decompressedStr)) !== null) {
-        const block = btMatch[1];
-
-        // Match TJ arrays: [(...) num (...) ] TJ
-        const tjRegex = /\[([\s\S]*?)\]\s*TJ/g;
-        let tjMatch: RegExpExecArray | null;
-        while ((tjMatch = tjRegex.exec(block)) !== null) {
-          const inner = tjMatch[1];
-          const strRegex = /\(([^)]*)\)/g;
-          let sm: RegExpExecArray | null;
-          let assembled = '';
-          while ((sm = strRegex.exec(inner)) !== null) {
-            assembled += unescapePdfString(sm[1]);
-          }
-          assembled = assembled.trim();
-          if (assembled.length > 0) {
-            texts.push(assembled);
-          }
-        }
-
-        // Match Tj: (...) Tj
-        const singleTjRegex = /\(([^)]*)\)\s*Tj/g;
-        let sMatch: RegExpExecArray | null;
-        while ((sMatch = singleTjRegex.exec(block)) !== null) {
-          const t = unescapePdfString(sMatch[1]).trim();
-          if (t.length > 0) {
-            texts.push(t);
-          }
-        }
-      }
-    }
+    return out;
   }
 
-  // Filter out any font binary glyph names; keep printable marketing text
-  const cleanTexts = texts.filter(
-    (t) => t.length > 0 && /^[a-zA-Z0-9\s.,!?:;'\"\"\\-–—/()&%]+$/.test(t)
-  );
+  if (baseFill && isMagentaColor(baseFill)) {
+    const trimmed = full.trim();
+    if (trimmed.length > 0) out.push(trimmed);
+  }
 
-  return Array.from(new Set(cleanTexts));
+  return out;
 }
 
 /**
  * Recursively extract all text strings from PSD layer hierarchy,
  * inspecting both native Photoshop text layers and embedded Smart Objects (AI/PDF & nested PSD/PSB).
+ *
+ * Alongside the copy itself, this reports any text painted in the magenta
+ * placeholder colour so the "Default Values" column can flag it.
  */
 function extractTextFromLayerTree(
   layers: Layer[],
   linkedFilesMap?: Map<string, any>
-): string[] {
+): LayerTextHarvest {
   const texts: string[] = [];
+  const magentaTexts: string[] = [];
 
   function walk(items: Layer[]) {
     for (const item of items) {
@@ -738,6 +814,11 @@ function extractTextFromLayerTree(
         if (cleaned.length > 0) {
           texts.push(cleaned);
         }
+
+        // Hidden layers are not part of the delivered artwork.
+        if (!item.hidden) {
+          magentaTexts.push(...magentaTextFromPsdLayer(item));
+        }
       }
 
       // 2. Smart Object placed layer (vector AI/PDF or nested PSD/PSB)
@@ -748,9 +829,12 @@ function extractTextFromLayerTree(
             const magic = new TextDecoder('latin1').decode(linked.data.subarray(0, 8));
             if (magic.startsWith('%PDF')) {
               // Vector AI / PDF smart object
-              const pdfTexts = extractTextFromPdfBuffer(linked.data);
-              for (const pt of pdfTexts) {
+              const extracted = extractTextFromPdfBuffer(linked.data);
+              for (const pt of extracted.texts) {
                 texts.push(pt);
+              }
+              if (!item.hidden) {
+                magentaTexts.push(...extracted.magentaTexts);
               }
             } else if (magic.startsWith('8BPS') || magic.startsWith('8BPB')) {
               // Nested Photoshop / PSB smart object
@@ -764,12 +848,15 @@ function extractTextFromLayerTree(
               for (const nf of nestedPsd.linkedFiles || []) {
                 if (nf.id) nestedLinkedMap.set(nf.id, nf);
               }
-              const nestedTexts = extractTextFromLayerTree(
+              const nested = extractTextFromLayerTree(
                 nestedPsd.children || [],
                 nestedLinkedMap
               );
-              for (const nt of nestedTexts) {
+              for (const nt of nested.texts) {
                 texts.push(nt);
+              }
+              if (!item.hidden) {
+                magentaTexts.push(...nested.magentaTexts);
               }
             }
           } catch (err) {
@@ -786,26 +873,33 @@ function extractTextFromLayerTree(
   }
 
   walk(layers);
-  return texts;
+
+  return {
+    texts,
+    magentaTexts: Array.from(new Set(magentaTexts)),
+  };
 }
 
 /**
- * Render artboard to a Canvas Blob for UI preview
+ * Render an artboard onto a canvas for the UI preview.
+ *
+ * The canvas (rather than a Blob) is returned so the caller can also run the
+ * QR sweep and the magenta pixel fallback against the same pixels.
  */
-async function renderArtboardToBlob(
+function renderArtboardToCanvas(
   psd: Psd,
   artboard: ArtboardInfo,
   extractedTexts: string[]
-): Promise<Blob> {
+): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   const w = Math.max(1, Math.round(artboard.width));
   const h = Math.max(1, Math.round(artboard.height));
   canvas.width = w;
   canvas.height = h;
 
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) {
-    return new Blob([], { type: 'image/png' });
+    return canvas;
   }
 
   // White base
@@ -913,7 +1007,16 @@ async function renderArtboardToBlob(
     }
   }
 
+  return canvas;
+}
+
+/** Convert a canvas to a PNG Blob, tolerating environments without toBlob. */
+function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   return new Promise<Blob>((resolve) => {
+    if (typeof canvas.toBlob !== 'function') {
+      resolve(new Blob([], { type: 'image/png' }));
+      return;
+    }
     canvas.toBlob((blob) => {
       resolve(blob || new Blob([], { type: 'image/png' }));
     }, 'image/png');
@@ -1026,12 +1129,14 @@ export async function processPsdFile(
     onProgress?.(`Processing artboard ${i + 1} of ${artboards.length}: ${artboard.name}...`);
 
     // 2. Extract text from text layers & embedded smart objects
-    const extractedTexts = extractTextFromLayerTree(artboard.children, linkedFilesMap);
+    const harvest = extractTextFromLayerTree(artboard.children, linkedFilesMap);
+    const extractedTexts = harvest.texts;
     const fullText = extractedTexts.join('\n\n');
 
     // 3. Render preview
     onProgress?.(`Rendering preview for ${artboard.name}...`);
-    const blob = await renderArtboardToBlob(psd, artboard, extractedTexts);
+    const canvas = renderArtboardToCanvas(psd, artboard, extractedTexts);
+    const blob = await canvasToPngBlob(canvas);
     const previewUrl = URL.createObjectURL(blob);
 
     // 4. OCR / Text result
@@ -1065,7 +1170,29 @@ export async function processPsdFile(
     onProgress?.(`Checking spelling for ${artboard.name}...`);
     const spellingIssues = checkSpelling(ocrResult.text);
 
-    // 6. Determine status
+    // 6. Default values — magenta placeholder copy from the layer data, with a
+    //    rendered-pixel fallback for artboards that are entirely rasterised.
+    let defaultValues: DefaultValueCheck = EMPTY_DEFAULT_VALUES;
+    if (harvest.magentaTexts.length > 0) {
+      defaultValues = {
+        hasMagentaText: true,
+        samples: harvest.magentaTexts.slice(0, 8),
+        method: 'layer',
+      };
+    } else if (scanCanvasForMagenta(canvas).found) {
+      defaultValues = { hasMagentaText: true, samples: [], method: 'pixel' };
+    }
+
+    // 7. QR codes on the rendered artboard
+    onProgress?.(`Scanning ${artboard.name} for QR codes...`);
+    let qr: QrScanOutcome = { scanned: false, links: [] };
+    try {
+      qr = await analyzeQrCodes(canvas);
+    } catch (err) {
+      console.warn('QR scan failed for artboard', artboard.name, err);
+    }
+
+    // 8. Determine status
     let status: ImageAnalysis['status'] = 'pass';
     if (!ocrResult.text || ocrResult.text.trim().length === 0) {
       status = 'no-text';
@@ -1098,12 +1225,217 @@ export async function processPsdFile(
       id: `psd-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 6)}`,
       fileName: displayName,
       previewUrl,
+      sourceType: 'psd',
       metadata,
       ocrResult,
       spellingIssues,
       status,
+      qr,
+      defaultValues,
     });
+
+    // Release the render surface — a 75-artboard batch would otherwise pin
+    // hundreds of megabytes of canvas backing store.
+    canvas.width = 0;
+    canvas.height = 0;
   }
 
   return analyses;
+}
+
+// ============================================
+// Illustrator (.ai) Processing
+// ============================================
+
+/**
+ * Process an Adobe Illustrator document: one QA row per artboard.
+ *
+ * Illustrator masters carry live vector copy, so spell-check runs against the
+ * real text (no OCR), the QR code is decoded from a high-resolution render, and
+ * magenta placeholder copy is read straight out of the fill operators.
+ */
+export async function processAiFile(
+  aiFile: File,
+  onProgress?: (stage: string) => void
+): Promise<ImageAnalysis[]> {
+  let artboards: Awaited<ReturnType<typeof processAiDocument>>;
+
+  try {
+    artboards = await processAiDocument(aiFile, onProgress);
+  } catch (err) {
+    if (err instanceof AiParseError) {
+      // Not PDF-compatible — fall back to the embedded XMP thumbnail so the
+      // asset still appears in the report instead of vanishing silently.
+      onProgress?.('Falling back to embedded Illustrator thumbnail...');
+      return [await analyzeAiFallback(aiFile, err.message)];
+    }
+    throw err;
+  }
+
+  const analyses: ImageAnalysis[] = [];
+
+  for (let i = 0; i < artboards.length; i++) {
+    const artboard = artboards[i];
+    onProgress?.(`Analysing artboard ${i + 1} of ${artboards.length}: ${artboard.name}...`);
+
+    const previewUrl = URL.createObjectURL(artboard.blob);
+    const fullText = artboard.texts.join('\n');
+
+    // 1. Text — vector copy is exact, so confidence is 100%.
+    let ocrResult: OCRResult;
+    if (fullText.trim().length > 0) {
+      ocrResult = {
+        text: fullText.trim(),
+        confidence: 100,
+        words: fullText
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean)
+          .map((w) => ({
+            text: w,
+            confidence: 100,
+            bbox: { x0: 0, y0: 0, x1: 0, y1: 0 },
+          })),
+      };
+    } else {
+      // Outlined type has no text objects left — fall back to native OCR.
+      onProgress?.(`Running OCR fallback on ${artboard.name}...`);
+      try {
+        ocrResult = await runOCR(previewUrl);
+      } catch (err) {
+        console.warn('OCR fallback failed for AI artboard', artboard.name, err);
+        ocrResult = { text: '', confidence: 0, words: [] };
+      }
+    }
+
+    // 2. Spelling — identical dictionary and stemming as every other asset.
+    onProgress?.(`Checking spelling for ${artboard.name}...`);
+    const spellingIssues = checkSpelling(ocrResult.text);
+
+    // 3. QR codes — thorough sweep, the QR is usually a small corner block.
+    onProgress?.(`Scanning ${artboard.name} for QR codes...`);
+    let qr: QrScanOutcome = { scanned: false, links: [] };
+    try {
+      qr = await analyzeQrCodes(artboard.canvas, { thorough: true });
+    } catch (err) {
+      console.warn('QR scan failed for AI artboard', artboard.name, err);
+    }
+    if (!qr.scanned) {
+      // No render to inspect, but the column still applies to AI assets.
+      qr = { scanned: true, links: [] };
+    }
+
+    // 4. Default values — magenta fills on the vector text.
+    let defaultValues: DefaultValueCheck = EMPTY_DEFAULT_VALUES;
+    if (artboard.magentaTexts.length > 0) {
+      defaultValues = {
+        hasMagentaText: true,
+        samples: artboard.magentaTexts.slice(0, 8),
+        method: 'vector',
+      };
+    } else if (artboard.canvas && scanCanvasForMagenta(artboard.canvas).found) {
+      defaultValues = { hasMagentaText: true, samples: [], method: 'pixel' };
+    }
+
+    let status: ImageAnalysis['status'] = 'pass';
+    if (!ocrResult.text || ocrResult.text.trim().length === 0) {
+      status = 'no-text';
+    } else if (spellingIssues.length > 0) {
+      status = 'flagged';
+    }
+
+    const displayName =
+      artboards.length > 1 ? `${aiFile.name} — ${artboard.name}` : aiFile.name;
+
+    const approxSize = artboard.blob.size || Math.round(aiFile.size / artboards.length);
+
+    analyses.push({
+      id: `ai-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 6)}`,
+      fileName: displayName,
+      previewUrl,
+      sourceType: 'ai',
+      metadata: {
+        fileName: displayName,
+        width: artboard.width,
+        height: artboard.height,
+        aspectRatio: calculateAspectRatio(artboard.width, artboard.height),
+        format: 'AI Artboard',
+        fileSize: approxSize,
+        fileSizeFormatted: formatFileSize(approxSize),
+        lastModified: aiFile.lastModified
+          ? new Date(aiFile.lastModified).toLocaleString()
+          : 'Unknown',
+        colorDepth: '24-bit (RGB)',
+      },
+      ocrResult,
+      spellingIssues,
+      status,
+      qr,
+      defaultValues,
+    });
+
+    if (artboard.canvas) {
+      artboard.canvas.width = 0;
+      artboard.canvas.height = 0;
+      artboard.canvas = null;
+    }
+  }
+
+  return analyses;
+}
+
+/**
+ * Fallback row for an .ai file saved without PDF compatibility: preview from
+ * the XMP thumbnail, QR scanned from that thumbnail, no vector text available.
+ */
+async function analyzeAiFallback(aiFile: File, reason: string): Promise<ImageAnalysis> {
+  const thumbnail = await extractAiXmpThumbnail(aiFile);
+
+  let img: HTMLImageElement | null = null;
+  if (thumbnail) {
+    try {
+      img = await loadImage(thumbnail);
+    } catch {
+      img = null;
+    }
+  }
+
+  let qr: QrScanOutcome = { scanned: true, links: [] };
+  if (img) {
+    try {
+      qr = await analyzeQrCodes(img, { thorough: true });
+    } catch (err) {
+      console.warn('QR scan failed for AI fallback preview:', err);
+    }
+  }
+
+  const width = img?.naturalWidth ?? 0;
+  const height = img?.naturalHeight ?? 0;
+
+  console.warn(`Illustrator file read in fallback mode: ${reason}`);
+
+  return {
+    id: `ai-${Date.now()}-fallback-${Math.random().toString(36).substr(2, 6)}`,
+    fileName: aiFile.name,
+    previewUrl: thumbnail || '',
+    sourceType: 'ai',
+    metadata: {
+      fileName: aiFile.name,
+      width,
+      height,
+      aspectRatio: width && height ? calculateAspectRatio(width, height) : '—',
+      format: 'AI (No PDF Data)',
+      fileSize: aiFile.size,
+      fileSizeFormatted: formatFileSize(aiFile.size),
+      lastModified: aiFile.lastModified
+        ? new Date(aiFile.lastModified).toLocaleString()
+        : 'Unknown',
+      colorDepth: '24-bit (RGB)',
+    },
+    ocrResult: { text: '', confidence: 0, words: [] },
+    spellingIssues: [],
+    status: 'no-text',
+    qr,
+    defaultValues: img ? detectMagentaInImage(img) : EMPTY_DEFAULT_VALUES,
+  };
 }

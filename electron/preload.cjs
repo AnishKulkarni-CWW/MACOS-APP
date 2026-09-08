@@ -8,5 +8,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getIllustratorLayers: () => ipcRenderer.invoke('get-illustrator-layers'),
   generateIllustratorVariations: (data) => ipcRenderer.invoke('generate-illustrator-variations', data),
   runNativeOCR: (data) => ipcRenderer.invoke('run-native-ocr', data),
+  checkUrl: (url) => ipcRenderer.invoke('check-url', url),
   reloadApp: () => ipcRenderer.invoke('reload-app')
 })
