@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+
+# Logs & editor/OS noise
+*.log
+npm-debug.log*
+.DS_Store
+.vscode/
+.idea/
