@@ -1,0 +1,185 @@
+@font-face {
+  font-family: 'BMWTypeNext';
+  src: url('./assets/fonts/BMWTypeNext-Light.otf') format('opentype');
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'BMWTypeNext';
+  src: url('./assets/fonts/BMWTypeNext-Bold.otf') format('opentype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* Colors */
+  --color-void-canvas: #0a0a0a;
+  --color-graphite: #161616;
+  --color-frosted-glass: #d4d4d4;
+  --color-ink-black: #000000;
+  --color-snow-white: #ffffff;
+  --color-bone: #ededed;
+  --color-ash: #c2c2c2;
+  --color-slate: #686868;
+  --color-smoke: #b2b2b2;
+  --color-hairline: #e5e5e5;
+  --color-dusk-violet: #6b62f2;
+  --gradient-dusk-violet: linear-gradient(90deg, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0) 40%, rgba(107, 98, 242, 0.565) 50%, rgba(0, 0, 0, 0) 60%, rgba(0, 0, 0, 0));
+
+  /* Typography — Font Families */
+  --font-dm-sans: 'BMWTypeNext', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-geist: 'BMWTypeNext', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-family: 'BMWTypeNext', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  /* Spacing */
+  --spacing-4: 4px;
+  --spacing-6: 6px;
+  --spacing-8: 8px;
+  --spacing-10: 10px;
+  --spacing-12: 12px;
+  --spacing-14: 14px;
+  --spacing-16: 16px;
+  --spacing-20: 20px;
+  --spacing-22: 22px;
+  --spacing-24: 24px;
+  --spacing-28: 28px;
+  --spacing-32: 32px;
+  --spacing-40: 40px;
+  --spacing-44: 44px;
+  --spacing-48: 48px;
+  --spacing-56: 56px;
+
+  /* Border Radius */
+  --radius-md: 4px;
+  --radius-lg: 10px;
+  --radius-2xl: 19px;
+  --radius-3xl: 24px;
+  --radius-3xl-2: 40px;
+  --radius-full: 64px;
+  --radius-full-2: 9999px;
+
+  /* Named Radii */
+  --radius-ui: 10px;
+  --radius-cards: 24px;
+  --radius-icons: 4px;
+  --radius-panels: 42px;
+  --radius-buttons: 9999px;
+  --radius-largecards: 40px;
+
+  /* Legacy aliases for now to prevent breaking current app before we rewrite App.css */
+  --bmw-white: var(--color-snow-white);
+  --bmw-black: var(--color-void-canvas);
+  --bmw-grey-dark: var(--color-graphite);
+  --bmw-grey-mid: #333333;
+  --bmw-grey-light: var(--color-ash);
+  --bmw-blue: var(--color-ink-black); 
+  --bmw-blue-hover: #333333;
+  
+  --glass-bg: rgba(212, 212, 212, 0.1); 
+  --glass-blur: blur(4px);
+  --glass-border: rgba(229, 229, 229, 0.2);
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-dm-sans);
+  background-color: var(--color-void-canvas);
+  color: var(--color-bone);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Allow window dragging on the whole body, override on specific elements */
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Base interactive elements should not be draggable */
+button, a, input, textarea, select {
+  -webkit-app-region: no-drag;
+}
+
+/* Glassmorphism Utilities */
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+/* White Pill CTA (Dimension) */
+.btn-primary {
+  background-color: var(--color-snow-white);
+  color: var(--color-ink-black);
+  border: none;
+  padding: 8px 12px; /* 8px vertical x 12px horizontal */
+  border-radius: var(--radius-full-2);
+  font-size: 14px;
+  font-family: var(--font-dm-sans);
+  font-weight: var(--font-weight-regular);
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  width: max-content;
+  align-self: flex-start;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background-color: var(--color-bone);
+  transform: translateY(-1px);
+}
+
+.btn-primary:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+/* Secondary Ghost Button */
+.btn-secondary {
+  background-color: transparent;
+  color: var(--color-bone);
+  border: 1px solid var(--color-hairline);
+  padding: 8px 16px;
+  border-radius: var(--radius-full-2);
+  font-size: 14px;
+  font-family: var(--font-dm-sans);
+  font-weight: var(--font-weight-regular);
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  width: max-content;
+  align-self: flex-start;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background-color: rgba(255, 255, 255, 0.05);
+  color: var(--color-snow-white);
+  transform: translateY(-1px);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bmw-black);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bmw-grey-mid);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--bmw-grey-light);
+}
