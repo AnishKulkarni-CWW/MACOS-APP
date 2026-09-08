@@ -524,9 +524,19 @@
   border: 1px solid var(--glass-border);
 }
 
+.qa-image-table {
+  /* thumb | file name | dimensions | format & size | default values | status */
+  --qa-grid: 60px 1.6fr 0.9fr 1.1fr 150px 100px;
+}
+
+.qa-image-table.has-qr {
+  /* ...with the Illustrator-only QR Links column inserted before status */
+  --qa-grid: 60px 1.4fr 0.8fr 1fr 1.15fr 140px 96px;
+}
+
 .qa-table-header {
   display: grid;
-  grid-template-columns: 60px 1.5fr 1fr 1fr 100px;
+  grid-template-columns: var(--qa-grid);
   gap: 12px;
   padding: 12px 18px;
   background: rgba(255, 255, 255, 0.03);
@@ -544,7 +554,7 @@
 
 .qa-table-row {
   display: grid;
-  grid-template-columns: 60px 1.5fr 1fr 1fr 100px;
+  grid-template-columns: var(--qa-grid);
   gap: 12px;
   padding: 10px 18px;
   background: rgba(212, 212, 212, 0.03);
@@ -682,3 +692,271 @@
 .qa-stagger-2 { animation-delay: 0.1s; }
 .qa-stagger-3 { animation-delay: 0.15s; }
 .qa-stagger-4 { animation-delay: 0.2s; }
+
+/* ============================================
+   Filter Bar
+   ============================================ */
+
+.qa-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 12px;
+  padding: 14px 16px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+}
+
+.qa-filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 130px;
+}
+
+.qa-filter-field.grow {
+  flex: 1 1 200px;
+  min-width: 180px;
+}
+
+.qa-filter-field label {
+  font-family: var(--font-dm-sans);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--color-slate);
+  font-weight: 500;
+}
+
+.qa-filter-field input,
+.qa-filter-field select {
+  font-family: var(--font-dm-sans);
+  font-size: 12.5px;
+  color: var(--color-bone);
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color 0.2s ease, background 0.2s ease;
+  width: 100%;
+}
+
+.qa-filter-field input::placeholder {
+  color: var(--color-slate);
+}
+
+.qa-filter-field input:focus,
+.qa-filter-field select:focus {
+  border-color: rgba(28, 105, 212, 0.6);
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.qa-filter-field select option {
+  background: #12151a;
+  color: var(--color-bone);
+}
+
+.qa-filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  padding-bottom: 2px;
+}
+
+.qa-filter-count {
+  font-family: var(--font-dm-sans);
+  font-size: 11.5px;
+  color: var(--color-slate);
+  white-space: nowrap;
+}
+
+.qa-filter-clear {
+  font-family: var(--font-dm-sans);
+  font-size: 12px;
+  color: var(--color-ash);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  padding: 7px 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.qa-filter-clear:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--color-bone);
+}
+
+.qa-filter-clear:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.qa-table-empty {
+  padding: 28px 18px;
+  text-align: center;
+  font-family: var(--font-dm-sans);
+  font-size: 13px;
+  color: var(--color-slate);
+  background: rgba(212, 212, 212, 0.03);
+}
+
+/* ============================================
+   QR Links column
+   ============================================ */
+
+.qa-cell-muted {
+  font-family: var(--font-dm-sans);
+  font-size: 13px;
+  color: var(--color-slate);
+}
+
+.qa-qr-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.qa-qr-pair {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.qa-qr-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 9999px;
+  font-family: var(--font-dm-sans);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+
+.qa-qr-badge.working {
+  background: rgba(74, 222, 128, 0.1);
+  color: #4ade80;
+  border: 1px solid rgba(74, 222, 128, 0.2);
+}
+
+.qa-qr-badge.broken {
+  background: rgba(248, 113, 113, 0.1);
+  color: #f87171;
+  border: 1px solid rgba(248, 113, 113, 0.22);
+}
+
+.qa-qr-badge.unknown {
+  background: rgba(251, 191, 36, 0.1);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.2);
+}
+
+.qa-qr-badge.indian {
+  background: rgba(56, 189, 248, 0.1);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.22);
+}
+
+.qa-qr-badge.non-indian,
+.qa-qr-badge.none {
+  background: rgba(148, 163, 184, 0.08);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.qa-qr-details {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: rgba(56, 189, 248, 0.04);
+  border: 1px solid rgba(56, 189, 248, 0.12);
+  border-radius: 10px;
+}
+
+.qa-qr-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.qa-qr-detail-url {
+  font-family: var(--font-dm-sans);
+  font-size: 12px;
+  color: var(--color-bone);
+  overflow-wrap: anywhere;
+}
+
+.qa-qr-detail-meta {
+  font-family: var(--font-dm-sans);
+  font-size: 11px;
+  color: var(--color-slate);
+  overflow-wrap: anywhere;
+}
+
+/* ============================================
+   Default Values column (magenta placeholders)
+   ============================================ */
+
+.qa-table-defaults {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.qa-default-values {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: rgba(255, 0, 255, 0.05);
+  border: 1px solid rgba(255, 0, 255, 0.18);
+  border-radius: 10px;
+}
+
+.qa-default-values-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-dm-sans);
+  font-size: 12px;
+  color: var(--color-ash);
+}
+
+.qa-magenta-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: #FF00FF;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  flex-shrink: 0;
+}
+
+.qa-default-values-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.qa-default-value-chip {
+  font-family: var(--font-dm-sans);
+  font-size: 11.5px;
+  color: var(--color-bone);
+  background: rgba(255, 0, 255, 0.09);
+  border: 1px solid rgba(255, 0, 255, 0.2);
+  border-radius: 6px;
+  padding: 3px 8px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}

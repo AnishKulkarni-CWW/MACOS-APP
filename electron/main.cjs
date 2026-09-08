@@ -163,6 +163,129 @@ ipcMain.handle('run-native-ocr', async (event, { buffer, fileName }) => {
   }
 });
 
+// ============================================
+// QR link validation
+// ============================================
+// Runs in the main process so QA link checks are not blocked by renderer CORS.
+
+const MAX_REDIRECTS = 5;
+const LINK_TIMEOUT_MS = 12000;
+const LINK_USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36 BMWAutomationQA/1.0';
+
+/**
+ * Issue a single request and resolve with the status and any redirect target.
+ * Never rejects — transport failures come back as { error }.
+ */
+function requestOnce(targetUrl, method) {
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch {
+      resolve({ error: 'Malformed URL' });
+      return;
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      resolve({ error: `Unsupported protocol: ${parsed.protocol}` });
+      return;
+    }
+
+    const transport = parsed.protocol === 'https:' ? require('https') : require('http');
+
+    const req = transport.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || undefined,
+        path: `${parsed.pathname}${parsed.search}`,
+        method,
+        headers: {
+          'User-Agent': LINK_USER_AGENT,
+          Accept: '*/*',
+        },
+        timeout: LINK_TIMEOUT_MS,
+      },
+      (res) => {
+        // We only need the headers; drain so the socket can be reused/closed.
+        res.resume();
+        resolve({ status: res.statusCode, location: res.headers.location });
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ error: `Timed out after ${LINK_TIMEOUT_MS / 1000}s` });
+    });
+
+    req.on('error', (err) => {
+      resolve({ error: err.message || String(err) });
+    });
+
+    req.end();
+  });
+}
+
+ipcMain.handle('check-url', async (event, url) => {
+  const target = typeof url === 'string' ? url : url && url.url;
+  if (!target) {
+    return { ok: false, error: 'No URL supplied' };
+  }
+
+  let current = target;
+  let lastStatus;
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    let result = await requestOnce(current, 'HEAD');
+
+    // Plenty of servers reject HEAD outright — retry those with GET before
+    // calling the link broken.
+    if (
+      result.error ||
+      result.status === 405 ||
+      result.status === 403 ||
+      result.status === 501
+    ) {
+      const getResult = await requestOnce(current, 'GET');
+      if (!getResult.error) {
+        result = getResult;
+      } else if (result.error) {
+        return { ok: false, finalUrl: current, error: result.error };
+      }
+    }
+
+    lastStatus = result.status;
+
+    const isRedirect =
+      typeof result.status === 'number' &&
+      result.status >= 300 &&
+      result.status < 400 &&
+      result.location;
+
+    if (!isRedirect) {
+      return {
+        ok: typeof result.status === 'number' && result.status < 400,
+        status: result.status,
+        finalUrl: current,
+      };
+    }
+
+    try {
+      current = new URL(result.location, current).toString();
+    } catch {
+      return { ok: false, status: result.status, finalUrl: current, error: 'Invalid redirect target' };
+    }
+  }
+
+  return {
+    ok: false,
+    status: lastStatus,
+    finalUrl: current,
+    error: `Too many redirects (>${MAX_REDIRECTS})`,
+  };
+});
+
 // App reload handler
 ipcMain.handle('reload-app', (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);

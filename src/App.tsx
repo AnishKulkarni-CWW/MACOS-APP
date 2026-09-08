@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import logo from './assets/images/logo.png';
 import mockupPreview from './assets/images/mockup_preview.png';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import { DealersDatabase } from './components/DealersDatabase';
 import { QaModule } from './components/QaModule';
 import './App.css';
@@ -156,7 +156,7 @@ function DesignerModule() {
           // ATTEMPT 1: PDF Vector Stream (Highest Quality)
           // This requires the AI file to be saved with "Create PDF Compatible File".
           try {
-            const pdfjsLib = await import('pdfjs-dist');
+            const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
             pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
             
             const arrayBuffer = await selectedFile.arrayBuffer();

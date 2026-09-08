@@ -178,7 +178,8 @@ An automated Quality Assurance powerhouse that checks design assets against BMW 
 1. **Universal Asset Ingestion**:
    - Drag and drop single images (`.jpg`, `.png`, `.webp`, `.tiff`, `.bmp`).
    - Drag and drop layered Photoshop files (`.psd`) containing single or multiple artboards.
-   - Drag and drop compressed `.zip` archives. The system unpacks the archive in memory, sanitizes out macOS hidden files (`__MACOSX`, `.DS_Store`), and evaluates all contained images.
+   - Drag and drop Adobe Illustrator files (`.ai`) — every artboard in the document becomes its own QC row.
+   - Drag and drop compressed `.zip` archives. The system unpacks the archive in memory, sanitizes out macOS hidden files (`__MACOSX`, `.DS_Store`), and evaluates all contained assets.
 2. **Multi-Artboard PSD Inspection**:
    - Automatically detects Photoshop artboards (`child.artboard.rect`).
    - Renders independent high-fidelity canvas previews for every individual artboard.
@@ -191,9 +192,23 @@ An automated Quality Assurance powerhouse that checks design assets against BMW 
    - 2.49 MB full offline English dictionary (`en_words.txt`).
    - BMW-specific whitelist covering model series, electric vehicle lines, proprietary technologies, and automotive terminology.
    - 40+ comprehensive morphological stemming rules.
-5. **Interactive QC Reporting**:
+5. **Multi-Artboard Illustrator Inspection**:
+   - Reads the PDF-compatible stream of an `.ai` file, treating each PDF page as one Illustrator artboard.
+   - Reports true artboard dimensions and renders every artboard at high resolution for preview and machine inspection.
+   - Pulls live vector copy straight from the document, so spell checking runs at 100% confidence with no OCR step.
+6. **QR Link Validation** (`QR Links` column, shown for Illustrator deliveries):
+   - Decodes the QR code embedded in each artboard from the high-resolution render, sweeping the frame in overlapping tiles so a small corner block is still found.
+   - Validates each decoded link on two parameters, reported as a pair of badges:
+     - **Working Link / Broken Link** — the URL is requested through the Electron main process (HEAD, falling back to GET, following up to 5 redirects). Any 4xx/5xx, DNS failure, TLS failure, or timeout marks the link broken.
+     - **IN Link** — the destination resolves to an Indian host (a `.in` TLD such as `bmw.in` or `bmw.co.in`, or an `in` country subdomain such as `in.bmw.com`). Shortlinks are judged on where they *land*, so a `bit.ly` that redirects to a `.in` page is still flagged as an IN link.
+7. **Default Value Detection** (`Default Values` column):
+   - Flags any artboard still carrying text in the BMW placeholder magenta — `#FF00FF` / `rgb(255, 0, 255)` / `cmyk(0, 100, 0, 0)` / `hsl(300, 100%, 50%)`.
+   - Reads the colour from the layer data rather than guessing from pixels: PSD text-layer `fillColor` (including per-range style runs), AI/PDF fill operators, and the streams of embedded AI smart objects. Rendered pixels are only sampled as a last resort, for fully rasterised assets.
+   - Marked **✅ Default Text** when placeholder copy is present, or **—** when the artboard is clean. The expanded row lists the exact offending strings.
+8. **Interactive QC Reporting**:
    - **Single Image Mode**: Technical specs (width, height, aspect ratio, color depth, file size), OCR confidence meter, full extracted copy, and itemized flagged issues with surrounding sentence context.
-   - **Batch Mode**: Top-level KPI metrics (Total Assets, Aggregate Size, Pass Count, Flagged Count), sortable multi-column table, and collapsible preview drawers.
+   - **Batch Mode**: Top-level KPI metrics (Total Assets, Aggregate Size, Pass Count, Flagged Count), multi-column table, and collapsible preview drawers.
+   - **Column Filters**: File-name search plus dropdown filters for Dimensions, Format, QR Links (working / broken / IN / non-IN / no QR), Default Values, and Status. Filters combine with AND, the KPI tiles follow the filtered set, and a single **Clear** resets everything.
 
 ---
 
@@ -212,6 +227,7 @@ An automated Quality Assurance powerhouse that checks design assets against BMW 
 | **Vector PDF Engine** | **pdfjs-dist 6.2.108** | Extracts vector artboards from Illustrator PDF streams via dedicated web worker. |
 | **Decompression** | **pako 3.0.1** | High-speed zlib/deflate decompression of embedded PDF/AI PostScript text operators (`BT...ET`). |
 | **Archive Handler** | **jszip 3.10.1** | In-memory decompression of multi-gigabyte ZIP archives. |
+| **QR Decoder** | **jsqr 1.4.0** | Pure-JS QR symbol detection over rendered artboard pixels, with inversion and threshold retries. |
 | **Fallback OCR** | **tesseract.js 7.0.0** | Standalone offline WASM SIMD LSTM engine with bundled English traineddata. |
 | **Typography** | **BMW Type Next** | Official BMW brand fonts (`BMWTypeNext-Light.otf`, `BMWTypeNext-Bold.otf`). |
 | **Design System** | **Vanilla CSS3** | Custom dark mode ("void canvas" `#0a0a0a`), frosted glassmorphism, and responsive CSS grids. |
@@ -249,7 +265,11 @@ bmw-macOs-app/
 │   │   ├── DealersDatabase.tsx     # Dealership selector component & mock database
 │   │   ├── QaModule.tsx            # Main QA interface (Upload, Processing, Single/Batch Reports)
 │   │   ├── QaModule.css            # Styles for QA dashboard, dropzones, tables, badges
-│   │   └── qaUtils.ts              # Core logic: PSD parsing, OCR dispatch, smart object text, spelling
+│   │   ├── qaUtils.ts              # Core logic: PSD parsing, OCR dispatch, smart object text, spelling
+│   │   ├── aiUtils.ts              # Illustrator (.ai) artboard parsing, vector copy, magenta fill operators
+│   │   ├── qrUtils.ts              # QR symbol detection and link validation (reachable / Indian destination)
+│   │   ├── colorUtils.ts           # Colour-space normalisation and magenta (#FF00FF) placeholder detection
+│   │   └── qaFilters.ts            # Filter model for the QA results table
 │   ├── App.tsx                     # Main layout, sidebar navigation, module switcher, Designer tools
 │   ├── App.css                     # Application layout, glass panels, forms, and cards
 │   ├── index.css                   # CSS design tokens, BMW typography declarations, root variables
@@ -440,6 +460,31 @@ When a `.psd` file is analyzed (`src/components/qaUtils.ts`):
      - `TJ` operators (kerning array strings) and `Tj` operators (standard strings)
    - Extracts all copy without rasterizing the vector artwork.
 
+### Illustrator Artboard Engine
+An `.ai` file saved with PDF compatibility *is* a PDF, one page per artboard, so `src/components/aiUtils.ts` drives it through pdf.js:
+1. **Artboard Discovery**: `pdf.numPages` gives the artboard count; `page.getViewport({ scale: 1 })` gives true artboard pixels (a PDF point maps 1:1 to an Illustrator pixel).
+2. **High-Resolution Render**: Each artboard is rendered to a canvas scaled towards an 1800 px long edge (capped at 4×) so QR modules stay legible. The preview blob is then written back down to the artboard's own size — the analysis needs the resolution, the thumbnail does not.
+3. **Vector Copy**: `page.getTextContent()` returns the live text, preserving line breaks via `hasEOL`. Only artwork with fully outlined type falls back to Apple Vision OCR.
+4. **Fill Colour Inspection**: `page.getOperatorList()` is walked with a graphics-state stack (`save`/`restore`), tracking the active fill and collecting the glyphs drawn while it is magenta. Text set to invisible rendering modes (`Tr 3`, `Tr 7`) is ignored.
+5. **Graceful Degradation**: A file saved *without* PDF compatibility raises `AiParseError`, and the asset still appears in the report using its embedded XMP thumbnail.
+
+> **Note**: The app deliberately imports pdf.js's `legacy` build. The modern bundle calls very recent JS built-ins (`Map.prototype.getOrInsertComputed` among them) that the Chromium inside Electron may not ship yet — without the legacy build, page rendering and operator lists throw and every artboard comes back blank.
+
+### QR Detection & Link Validation
+1. **Detection** (`src/components/qrUtils.ts`): the artboard render is normalised into jsQR's sweet spot, decoded whole-frame, then swept as a 5×5 grid of third-size tiles stepping by half a tile — so any QR up to a third of the frame lands whole inside at least one tile no matter where it sits. Flat tiles are rejected by a cheap luminance-range test before jsQR is asked. If nothing is found, the frame and tiles are re-read with a hard black/white threshold, which rescues low-contrast and brand-tinted prints.
+2. **Validation** (`electron/main.cjs`, `check-url` IPC): requests run in the main process so they are not blocked by renderer CORS. HEAD first, retried with GET for the many servers that reject HEAD, following up to 5 redirects with a 12 s timeout. Verdicts are cached per batch so a shared landing page is fetched once.
+3. **Destination Test**: the hostname of both the original and final URL is split on `.`; an `in` segment means an Indian destination. This matches `bmw.in` and `bmw.co.in` as well as `in.bmw.com`, while correctly leaving `linkedin.com` and `india.com` alone.
+
+### Magenta Placeholder ("Default Values") Detection
+`src/components/colorUtils.ts` normalises every colour shape the pipeline can produce — RGB/RGBA (0–255), FRGB (0–1), CMYK, HSB, Grayscale — into plain RGB, then tests it in HSL space against a set of anchors rather than a single hard-coded hex:
+
+| Anchor | Rendered as | Why it is needed |
+| :--- | :--- | :--- |
+| sRGB magenta | `#FF00FF` (hue 300°) | Photoshop text layers and RGB Illustrator documents. |
+| DeviceCMYK magenta | `#FB3199` (hue 329°) | pdf.js converts `0/100/0/0` with the calibrated profile PDF viewers use — a CMYK master would never match a plain hue-300 test. |
+
+Each anchor carries its own hue, saturation and lightness window. The lightness ceilings are what separate a full-strength placeholder from a light tint (CMYK `0/50/0/0` lands at lightness 0.80 and is correctly ignored), and pixel sampling uses tighter windows than structured colour data so anti-aliasing and JPEG artefacts cannot promote a pink into a flag.
+
 ### Proprietary BMW Dictionary & Stemming Engine
 The spelling engine combines:
 1. **Base Lexicon**: Standard English dictionary with ~235,000 entries (`src/assets/dictionary/en_words.txt`).
@@ -467,6 +512,15 @@ chmod +x electron/ocr-vision
 
 #### Q: Why does an Illustrator (.ai) file show a blank preview or parse error in Designer Tools?
 **A**: Illustrator files must be saved with the **"Create PDF Compatible File"** checkbox checked in the Illustrator Save dialog. This ensures the embedded PDF vector stream is written to the file. If saving without PDF compatibility, the app automatically falls back to reading the embedded XMP thumbnail.
+
+#### Q: An Illustrator file uploaded to QA Evaluation shows no artboards.
+**A**: Same root cause as the Designer Tools preview — the file must be saved with **"Create PDF Compatible File"** enabled. Without the embedded PDF stream there are no artboards to read, and QA falls back to a single row built from the XMP thumbnail.
+
+#### Q: The QR Links column shows "? Unverified" instead of Working or Broken.
+**A**: Link checking runs through the Electron main process. Running the UI in a plain browser (`npm run dev` without the desktop shell) leaves the status indeterminate because a browser cannot read the status code of a cross-origin response. Use the desktop app for authoritative link verdicts.
+
+#### Q: The QR Links column is missing entirely.
+**A**: The column appears when the batch contains an Illustrator file, or when a QR code was decoded on any asset. A PSD-only or image-only batch with no QR codes hides it rather than showing an empty column.
 
 #### Q: How do I reload the app during development without restarting Electron?
 **A**: Click the **Refresh App** button located in the top window drag bar or at the bottom of the sidebar, or press `Cmd + R` inside the window.
