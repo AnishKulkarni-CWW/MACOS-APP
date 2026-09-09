@@ -1,5 +1,10 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
-import type { ImageAnalysis, ProcessingProgress, QrLinkResult } from './qaUtils';
+import type {
+  DefaultValueCheck,
+  ImageAnalysis,
+  ProcessingProgress,
+  QrLinkResult,
+} from './qaUtils';
 import {
   analyzeImage,
   initOCRWorker,
@@ -940,23 +945,40 @@ function QrLinkDetails({ links }: { links: QrLinkResult[] }) {
 // ============================================
 
 function DefaultValuesCell({ analysis }: { analysis: ImageAnalysis }) {
-  if (!analysis.defaultValues.hasMagentaText) {
+  const { hasMagenta, inText } = analysis.defaultValues;
+
+  if (!hasMagenta) {
     return <span className="qa-cell-muted">—</span>;
   }
-  return <span className="qa-status-badge pass">✅ Default Text</span>;
+
+  // Magenta on type is placeholder copy; magenta anywhere else is placeholder
+  // artwork. Both are delivery defects, and the distinction tells the reviewer
+  // where to look.
+  return (
+    <span className="qa-status-badge pass">
+      ✅ {inText ? 'Default Text' : 'Default Value'}
+    </span>
+  );
 }
 
+const DEFAULT_VALUE_SOURCE: Record<DefaultValueCheck['method'], string> = {
+  layer: 'in the layer data',
+  vector: 'in the vector artwork',
+  pixel: 'in the rendered artwork',
+  none: '',
+};
+
 function DefaultValueSamples({ analysis }: { analysis: ImageAnalysis }) {
-  const { hasMagentaText, samples, method } = analysis.defaultValues;
-  if (!hasMagentaText) return null;
+  const { hasMagenta, inText, samples, method } = analysis.defaultValues;
+  if (!hasMagenta) return null;
 
   return (
     <div className="qa-default-values">
       <div className="qa-default-values-head">
         <span className="qa-magenta-swatch" aria-hidden="true" />
         <span>
-          Magenta (#FF00FF) text detected
-          {method === 'pixel' ? ' in the rendered artwork' : ' in the layer data'}
+          Magenta (#FF00FF) {inText ? 'text' : 'artwork'} detected{' '}
+          {DEFAULT_VALUE_SOURCE[method]}
         </span>
       </div>
       {samples.length > 0 && (

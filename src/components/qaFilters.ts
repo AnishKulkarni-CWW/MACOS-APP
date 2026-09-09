@@ -81,8 +81,8 @@ export function applyFilters(analyses: ImageAnalysis[], filters: QaFilters): Ima
     if (filters.dimensions !== 'all' && dimensionKey(a) !== filters.dimensions) return false;
     if (!matchesQrFilter(a, filters.qr)) return false;
 
-    if (filters.defaults === 'default' && !a.defaultValues.hasMagentaText) return false;
-    if (filters.defaults === 'clean' && a.defaultValues.hasMagentaText) return false;
+    if (filters.defaults === 'default' && !a.defaultValues.hasMagenta) return false;
+    if (filters.defaults === 'clean' && a.defaultValues.hasMagenta) return false;
 
     return true;
   });

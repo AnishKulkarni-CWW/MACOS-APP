@@ -203,10 +203,13 @@ An automated Quality Assurance powerhouse that checks design assets against BMW 
      - **Working Link / Broken Link** — the URL is requested through the Electron main process (HEAD, falling back to GET, following up to 5 redirects). Any 4xx/5xx, DNS failure, TLS failure, or timeout marks the link broken.
      - **IN Link** — the destination resolves to an Indian host (a `.in` TLD such as `bmw.in` or `bmw.co.in`, or an `in` country subdomain such as `in.bmw.com`). Shortlinks are judged on where they *land*, so a `bit.ly` that redirects to a `.in` page is still flagged as an IN link.
 7. **Default Value Detection** (`Default Values` column):
-   - Flags any artboard still carrying text in the BMW placeholder magenta — `#FF00FF` / `rgb(255, 0, 255)` / `cmyk(0, 100, 0, 0)` / `hsl(300, 100%, 50%)`.
-   - Reads the colour from the layer data rather than guessing from pixels: PSD text-layer `fillColor` (including per-range style runs), AI/PDF fill operators, and the streams of embedded AI smart objects. Rendered pixels are only sampled as a last resort, for fully rasterised assets.
+   - Flags any artboard where the BMW placeholder magenta — `#FF00FF` / `rgb(255, 0, 255)` / `cmyk(0, 100, 0, 0)` / `hsl(300, 100%, 50%)` — survives **anywhere in any layer**, not only on live type.
+   - In Illustrator that means text fills and strokes, **outlined type**, filled and stroked paths, rules, swatches and logos. In Photoshop it means text-layer `fillColor` (including per-range style runs), shape and vector fills, strokes, layer effects, gradient stops and solid-colour fill layers.
+   - Reads the colour from the layer and vector data rather than guessing from pixels. Rendered pixels are sampled only as a fallback — for fully rasterised assets, and for gradients, whose colour pdf.js resolves through a separate pattern object.
+   - Reports **Default Text** when the magenta sits on type and **Default Value** when it survives only as artwork. Both are flagged, both are filterable; the distinction tells the reviewer where to look.
    - Works in **CMYK documents as well as RGB ones**. Typing `#FF00FF` into the colour picker of a CMYK Illustrator file makes Illustrator convert it through the working profile, so what is actually stored is a magenta-dominant ink mix (`0/100/0/0`, `8/98/0/0`, `17/91/0/0`, …) rather than the literal hex — all of which are recognised.
-   - Flagging does not depend on being able to quote the copy: a subsetted font with no usable character mapping still raises the flag, it simply reports no sample text.
+   - Flagging does not depend on being able to quote the copy: outlined type has no glyphs at all, and a subsetted font with no usable character mapping decodes to nothing. The artboard is still flagged, it simply reports no sample text.
+   - Hidden layers and switched-off layer effects are excluded — they are not part of the delivered artwork.
    - Marked **✅ Default Text** when placeholder copy is present, or **—** when the artboard is clean. The expanded row lists the exact offending strings.
 8. **Interactive QC Reporting**:
    - **Single Image Mode**: Technical specs (width, height, aspect ratio, color depth, file size), OCR confidence meter, full extracted copy, and itemized flagged issues with surrounding sentence context.
@@ -496,7 +499,13 @@ Testing for `#FF00FF` literally does not work, because the placeholder rarely su
 
 The lightness ceilings are what separate a full-strength placeholder from a light tint: CMYK `0/50/0/0` renders at lightness 0.80 and is correctly ignored. Pixel sampling uses deliberately tighter windows than structured colour, because that path only runs when no layer or vector colour was found and BMW artwork is full of sunset photography whose pinks would otherwise read as placeholder copy.
 
-Finally, the flag is independent of the sample text. A subsetted font whose glyphs carry no usable character mapping decodes to nothing, but the artboard still has magenta text on it — so it is still flagged, with no quoted sample.
+**Magenta is searched for everywhere it can hide**, because a placeholder that survives as artwork is exactly as much of a delivery defect as one that survives as type:
+
+- *Illustrator* — the page's operator list is walked with a graphics-state stack, tracking both fill and stroke. This build of pdf.js does not emit `fill` / `stroke` as standalone operators; it folds them into `constructPath`, whose first argument is the paint operator's own code. Watching only `showText` therefore misses every filled and stroked path — which is exactly how outlined type, rules, swatches and logos are drawn in a press-ready file. Pattern fills clear the tracked colour rather than letting a stale one stand, and text set to an invisible rendering mode (`Tr 3`, `Tr 7`) is ignored.
+- *Photoshop* — every layer is scanned for colour records by shape rather than by a fixed list of properties, so a magenta text fill, shape fill, stroke, layer effect, gradient stop or solid-colour fill layer all surface the same way. Pixel data and children are skipped, as are hidden layers and effects marked `enabled: false`.
+- *Rendered pixels* — the fallback, kept tight, covering flattened rasters and gradients (pdf.js hands `shadingFill` only a pattern id, resolving the stops separately, so gradients cannot be read from the operator list).
+
+Finally, the flag is independent of the sample text. Outlined type has no glyphs, and a subsetted font whose glyphs carry no usable character mapping decodes to nothing — but the artboard still has magenta on it, so it is still flagged, with no quoted sample.
 
 ### Proprietary BMW Dictionary & Stemming Engine
 The spelling engine combines:
@@ -547,8 +556,11 @@ chmod +x electron/ocr-vision
 #### Q: Why are dealer names and localities not spell-checked?
 **A**: By design. Contact lines (anything with a phone number, URL or email) and short Title-Case label lines are treated as proper names and excluded before the dictionary is consulted — see **Non-Prose Masking** above. Marketing copy is unaffected: any line containing a lowercase word, or ending in sentence punctuation, is still checked in full.
 
-#### Q: I set text to #FF00FF but Default Values still shows a dash.
-**A**: Confirm the text is *text*, not outlines. Type that has been converted to outlines (Type ▸ Create Outlines) has no text objects left, so the vector check finds nothing and only the much stricter pixel fallback applies. Colour itself is not the issue — magenta is recognised in CMYK documents as well as RGB ones, including the ink mixes Illustrator produces when it converts `#FF00FF` through a CMYK working profile.
+#### Q: What is the difference between "Default Text" and "Default Value"?
+**A**: Both mean placeholder magenta survived into the delivery. **Default Text** means it is on live type; **Default Value** means it survives only as artwork — outlined type, a filled or stroked path, a shape fill, a layer effect or a gradient. Both are flagged and both match the *Default text* filter.
+
+#### Q: I set something to #FF00FF but Default Values still shows a dash.
+**A**: Check that the layer is visible and, if the colour came from a layer effect, that the effect is enabled — hidden layers and switched-off effects are deliberately excluded. Colour space is not the issue: magenta is recognised in CMYK documents as well as RGB ones, including the ink mixes Illustrator produces when it converts `#FF00FF` through a CMYK working profile, and it is detected on outlined type and artwork as well as on live text.
 
 #### Q: How do I reload the app during development without restarting Electron?
 **A**: Click the **Refresh App** button located in the top window drag bar or at the bottom of the sidebar, or press `Cmd + R` inside the window.

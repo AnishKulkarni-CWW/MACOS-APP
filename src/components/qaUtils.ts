@@ -8,7 +8,7 @@ import {
   extractTextFromPdfBuffer,
   processAiDocument,
 } from './aiUtils';
-import { isMagentaColor, scanCanvasForMagenta } from './colorUtils';
+import { findMagentaInObject, isMagentaColor, scanCanvasForMagenta } from './colorUtils';
 import { analyzeQrCodes } from './qrUtils';
 import type { QrScanOutcome } from './qrUtils';
 
@@ -66,12 +66,19 @@ export interface SpellingIssue {
 export type AssetSource = 'image' | 'psd' | 'ai';
 
 /**
- * Result of the "Default Values" check: has any text on this artboard been left
- * in the magenta (#FF00FF) placeholder colour?
+ * Result of the "Default Values" check: is anything on this artboard still in
+ * the magenta (#FF00FF) placeholder colour?
+ *
+ * Magenta is searched for everywhere it can hide — text fills and strokes,
+ * outlined type, shape fills, layer effects, gradient stops — because a
+ * placeholder that survives as artwork rather than as live type is exactly as
+ * much of a delivery defect.
  */
 export interface DefaultValueCheck {
-  hasMagentaText: boolean;
-  /** The offending copy, so the reviewer knows what still needs localising. */
+  hasMagenta: boolean;
+  /** True when the magenta sits on type rather than only on artwork. */
+  inText: boolean;
+  /** What was found, so the reviewer knows what still needs localising. */
   samples: string[];
   /** How the verdict was reached. */
   method: 'layer' | 'vector' | 'pixel' | 'none';
@@ -92,7 +99,8 @@ export interface ImageAnalysis {
 }
 
 const EMPTY_DEFAULT_VALUES: DefaultValueCheck = {
-  hasMagentaText: false,
+  hasMagenta: false,
+  inText: false,
   samples: [],
   method: 'none',
 };
@@ -836,7 +844,7 @@ function detectMagentaInImage(img: HTMLImageElement): DefaultValueCheck {
 
     const result = scanCanvasForMagenta(canvas);
     return result.found
-      ? { hasMagentaText: true, samples: [], method: 'pixel' }
+      ? { hasMagenta: true, inText: false, samples: [], method: 'pixel' }
       : EMPTY_DEFAULT_VALUES;
   } catch (err) {
     console.warn('Magenta pixel scan failed:', err);
@@ -856,10 +864,39 @@ interface ArtboardInfo {
   children: Layer[];
 }
 
-/** Text pulled out of a PSD layer tree, split by whether it is placeholder copy. */
+/** What one pass over a PSD layer tree produced. */
 interface LayerTextHarvest {
   texts: string[];
+  /** Magenta copy, quoted from the text layers it was found on. */
   magentaTexts: string[];
+  /** Layers whose artwork (not type) uses magenta, described for the report. */
+  magentaLayers: string[];
+}
+
+/**
+ * Every property of a layer that is not its type, its pixels or its children.
+ *
+ * Scanning this rather than the whole layer keeps the search away from image
+ * data while still reaching shape fills, strokes, layer effects, gradient
+ * stops, solid-colour fill layers and anything else ag-psd decodes — which is
+ * what "magenta anywhere in the layer" actually requires.
+ */
+function magentaArtworkInLayer(layer: Layer): boolean {
+  const { text, canvas, imageData, children, mask, ...rest } =
+    layer as Layer & Record<string, unknown>;
+  void text;
+  void canvas;
+  void imageData;
+  void children;
+  void mask;
+
+  return findMagentaInObject(rest).length > 0;
+}
+
+/** A readable name for a layer, for reporting where magenta was found. */
+function describeLayer(layer: Layer, index: number): string {
+  const name = layer.name?.trim();
+  return name && name.length > 0 ? name : `Layer ${index + 1}`;
 }
 
 /**
@@ -915,9 +952,18 @@ function extractTextFromLayerTree(
 ): LayerTextHarvest {
   const texts: string[] = [];
   const magentaTexts: string[] = [];
+  const magentaLayers: string[] = [];
 
   function walk(items: Layer[]) {
-    for (const item of items) {
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+
+      // Magenta anywhere in this layer's own properties — a shape fill, a
+      // stroke, a layer effect, a gradient stop, a solid-colour fill layer.
+      if (!item.hidden && magentaArtworkInLayer(item)) {
+        magentaLayers.push(describeLayer(item, index));
+      }
+
       // 1. Direct native Photoshop text layer
       if (item.text && typeof item.text.text === 'string') {
         const cleaned = item.text.text
@@ -970,6 +1016,7 @@ function extractTextFromLayerTree(
               }
               if (!item.hidden) {
                 magentaTexts.push(...nested.magentaTexts);
+                magentaLayers.push(...nested.magentaLayers);
               }
             }
           } catch (err) {
@@ -990,6 +1037,7 @@ function extractTextFromLayerTree(
   return {
     texts,
     magentaTexts: Array.from(new Set(magentaTexts)),
+    magentaLayers: Array.from(new Set(magentaLayers)),
   };
 }
 
@@ -1286,14 +1334,18 @@ export async function processPsdFile(
     // 6. Default values — magenta placeholder copy from the layer data, with a
     //    rendered-pixel fallback for artboards that are entirely rasterised.
     let defaultValues: DefaultValueCheck = EMPTY_DEFAULT_VALUES;
-    if (harvest.magentaTexts.length > 0) {
+    if (harvest.magentaTexts.length > 0 || harvest.magentaLayers.length > 0) {
       defaultValues = {
-        hasMagentaText: true,
-        samples: harvest.magentaTexts.slice(0, 8),
+        hasMagenta: true,
+        inText: harvest.magentaTexts.length > 0,
+        samples: (harvest.magentaTexts.length > 0
+          ? harvest.magentaTexts
+          : harvest.magentaLayers
+        ).slice(0, 8),
         method: 'layer',
       };
     } else if (scanCanvasForMagenta(canvas).found) {
-      defaultValues = { hasMagentaText: true, samples: [], method: 'pixel' };
+      defaultValues = { hasMagenta: true, inText: false, samples: [], method: 'pixel' };
     }
 
     // 7. QR codes on the rendered artboard
@@ -1440,16 +1492,18 @@ export async function processAiFile(
 
     // 4. Default values — magenta fills on the vector text.
     let defaultValues: DefaultValueCheck = EMPTY_DEFAULT_VALUES;
-    if (artboard.hasMagentaText) {
-      // Samples can legitimately be empty — an unreadable subset font does not
-      // make the magenta any less present.
+    if (artboard.hasMagenta) {
+      // Samples can legitimately be empty — outlined type has no glyphs, and an
+      // unreadable subset font decodes to nothing. Neither makes the magenta
+      // any less present.
       defaultValues = {
-        hasMagentaText: true,
+        hasMagenta: true,
+        inText: artboard.magentaInText,
         samples: artboard.magentaTexts.slice(0, 8),
         method: 'vector',
       };
     } else if (artboard.canvas && scanCanvasForMagenta(artboard.canvas).found) {
-      defaultValues = { hasMagentaText: true, samples: [], method: 'pixel' };
+      defaultValues = { hasMagenta: true, inText: false, samples: [], method: 'pixel' };
     }
 
     let status: ImageAnalysis['status'] = 'pass';

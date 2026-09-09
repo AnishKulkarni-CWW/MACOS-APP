@@ -356,3 +356,97 @@ export function scanCanvasForMagenta(
     coverage,
   };
 }
+
+/**
+ * Does this value look like a colour record?
+ *
+ * ag-psd represents colour as small plain objects and uses the same shapes
+ * everywhere — text fills, layer effects, shape fills, strokes, gradient stops,
+ * solid-colour fill layers. Recognising the shape means a scan finds colours
+ * anywhere in a layer without having to enumerate every property that can hold
+ * one.
+ */
+export function looksLikeColor(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+
+  const num = (k: string) => typeof v[k] === 'number';
+  const rgb = num('r') && num('g') && num('b');
+  const frgb = num('fr') && num('fg') && num('fb');
+  const cmyk = num('c') && num('m') && num('y') && num('k');
+  const hsb = num('h') && num('s') && num('b');
+  if (!rgb && !frgb && !cmyk && !hsb) return false;
+
+  // Colour records are small; anything with a lot of other keys is a different
+  // structure that happens to share a letter (bounds, transforms, and so on).
+  return Object.keys(v).length <= 6;
+}
+
+/** Keys whose contents are pixels or structure, never a colour worth scanning. */
+const UNSCANNABLE_KEYS = new Set([
+  'canvas', 'imageData', 'image', 'thumbnail', 'data', 'children', 'mask',
+  'layers', 'linkedFiles', 'imageResources', 'engineData',
+]);
+
+export interface MagentaHit {
+  /** Dotted path to the colour inside the layer, e.g. "effects.stroke.0.color". */
+  path: string;
+  rgb: RgbColor;
+}
+
+/**
+ * Walk an arbitrary object graph and collect every magenta colour in it.
+ *
+ * Used to answer "is magenta used anywhere in this layer?" without depending on
+ * a fixed list of properties — a magenta text fill, a magenta layer effect, a
+ * magenta shape fill and a magenta gradient stop all surface the same way.
+ */
+export function findMagentaInObject(
+  root: unknown,
+  options: { maxDepth?: number; maxNodes?: number } = {}
+): MagentaHit[] {
+  const maxDepth = options.maxDepth ?? 8;
+  const maxNodes = options.maxNodes ?? 20000;
+
+  const hits: MagentaHit[] = [];
+  let visited = 0;
+  const seen = new Set<object>();
+
+  const walk = (value: unknown, path: string, depth: number) => {
+    if (depth > maxDepth || visited > maxNodes) return;
+    if (!value || typeof value !== 'object') return;
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
+
+    // Cycles are possible once linked files reference each other.
+    if (seen.has(value as object)) return;
+    seen.add(value as object);
+    visited++;
+
+    // A switched-off layer effect is not part of the delivered artwork.
+    if ((value as Record<string, unknown>).enabled === false) return;
+    if ((value as Record<string, unknown>).disabled === true) return;
+
+    if (looksLikeColor(value)) {
+      if (isMagentaColor(value)) {
+        const rgb = normalizeColorToRgb(value);
+        if (rgb) hits.push({ path, rgb });
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length && visited <= maxNodes; i++) {
+        walk(value[i], path ? `${path}.${i}` : String(i), depth + 1);
+      }
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (UNSCANNABLE_KEYS.has(key)) continue;
+      walk(child, path ? `${path}.${key}` : key, depth + 1);
+    }
+  };
+
+  walk(root, '', 0);
+  return hits;
+}

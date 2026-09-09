@@ -55,13 +55,15 @@ export interface AiArtboard {
   blob: Blob;
   /** Vector copy found on the artboard. */
   texts: string[];
-  /** Text runs painted in magenta (#FF00FF) — i.e. untouched default values. */
+  /** Magenta copy that could be read back — may be empty even when flagged. */
   magentaTexts: string[];
   /**
-   * True when magenta text was painted on the artboard. Independent of
-   * `magentaTexts`, which stays empty when the glyphs cannot be read back.
+   * True when anything on the artboard is painted magenta. Independent of
+   * `magentaTexts`, which stays empty for outlined type and unmappable fonts.
    */
-  hasMagentaText: boolean;
+  hasMagenta: boolean;
+  /** True when the magenta was used on type rather than only on artwork. */
+  magentaInText: boolean;
 }
 
 // ============================================
@@ -162,26 +164,50 @@ function glyphsToString(glyphs: unknown): string {
 
 /** What a page-level magenta scan found. */
 export interface MagentaScan {
-  /** True when magenta text was painted, whether or not it could be read. */
+  /** True when anything on the artboard is painted magenta. */
   found: boolean;
-  /** Readable samples of that text, when the glyphs map back to characters. */
+  /** True when magenta was used on type specifically. */
+  inText: boolean;
+  /** Readable samples of magenta copy, when the glyphs map back to characters. */
   samples: string[];
 }
 
 /**
- * Walk a page's operator list tracking the active colours, and report the text
- * drawn in magenta.
+ * Path-painting operators, keyed by what they actually paint.
+ *
+ * This pdf.js build does not emit `fill` / `stroke` as standalone operators —
+ * it folds them into `constructPath`, whose first argument is the paint
+ * operator's own code. Watching only `showText` therefore misses every filled
+ * and stroked path, which is exactly how outlined type, rules, swatches and
+ * logos are drawn in a press-ready Illustrator file.
+ */
+function buildPaintKinds(OPS: Record<string, number>) {
+  const fills = new Set([OPS.fill, OPS.eoFill, OPS.rawFillPath]);
+  const strokes = new Set([OPS.stroke, OPS.closeStroke]);
+  const both = new Set([
+    OPS.fillStroke,
+    OPS.eoFillStroke,
+    OPS.closeFillStroke,
+    OPS.closeEOFillStroke,
+  ]);
+  return { fills, strokes, both };
+}
+
+/**
+ * Walk a page's operator list tracking the active colours, and report every use
+ * of magenta on the artboard — type, filled paths, strokes and gradients alike.
  *
  * pdf.js normalises every colour operator (rg / k / g / sc / scn) into
  * `setFillRGBColor` / `setStrokeRGBColor` carrying a single `#rrggbb` string,
  * so this reads whatever colour space Illustrator used.
  *
- * `found` is deliberately independent of `samples`: a subset font with a custom
- * encoding can leave glyphs with no usable unicode mapping, and a price like
- * "₹59,999*" would then decode to nothing. The artboard still has magenta text
- * on it, so it must still be flagged — we just cannot quote it.
+ * `found` is deliberately independent of `samples`. Outlined type has no glyphs
+ * at all, and a subset font with a custom encoding can leave glyphs with no
+ * usable unicode mapping — a price like "₹59,999*" then decodes to nothing. The
+ * artboard still has magenta on it, so it must still be flagged; we simply
+ * cannot quote it.
  */
-async function findMagentaTextOnPage(page: {
+async function findMagentaOnPage(page: {
   getOperatorList: () => Promise<{ fnArray: number[]; argsArray: unknown[][] }>;
 }, OPS: Record<string, number>): Promise<MagentaScan> {
   let opList: { fnArray: number[]; argsArray: unknown[][] };
@@ -189,11 +215,13 @@ async function findMagentaTextOnPage(page: {
     opList = await page.getOperatorList();
   } catch (err) {
     console.warn('Could not read AI operator list for colour analysis:', err);
-    return { found: false, samples: [] };
+    return { found: false, inText: false, samples: [] };
   }
 
+  const { fills, strokes, both } = buildPaintKinds(OPS);
   const samples: string[] = [];
   let found = false;
+  let inText = false;
 
   interface GraphicsState {
     fill: RgbColor | null;
@@ -231,11 +259,28 @@ async function findMagentaTextOnPage(page: {
       state.fill = null;
       continue;
     }
+    if (op === OPS.setStrokeTransparent) {
+      state.stroke = null;
+      continue;
+    }
+    // A pattern fill leaves pdf.js unable to report a flat colour. Clear the
+    // state rather than letting the previous colour stand, or the next path
+    // would be judged against a colour it is not painted in.
+    if (op === OPS.setFillColorN) {
+      state.fill = null;
+      continue;
+    }
+    if (op === OPS.setStrokeColorN) {
+      state.stroke = null;
+      continue;
+    }
     if (op === OPS.setTextRenderingMode) {
       const mode = args?.[0];
       state.textRenderMode = typeof mode === 'number' ? mode : 0;
       continue;
     }
+
+    // --- Type ---
     if (op === OPS.showText) {
       const mode = state.textRenderMode;
       // 3 = invisible, 7 = clip-only. Neither is visible placeholder copy.
@@ -251,13 +296,46 @@ async function findMagentaTextOnPage(page: {
       if (!isMagenta) continue;
 
       found = true;
+      inText = true;
 
       const text = glyphsToString(args?.[0]).trim();
       if (text.length > 0) samples.push(text);
+      continue;
     }
+
+    // --- Paths: outlined type, rules, swatches, logos ---
+    if (op === OPS.constructPath) {
+      const paintOp = args?.[0];
+      if (typeof paintOp !== 'number') continue;
+
+      const paintsFill = fills.has(paintOp) || both.has(paintOp);
+      const paintsStroke = strokes.has(paintOp) || both.has(paintOp);
+
+      if (
+        (paintsFill && isMagentaRgb(state.fill)) ||
+        (paintsStroke && isMagentaRgb(state.stroke))
+      ) {
+        found = true;
+      }
+      continue;
+    }
+
+    // Standalone paint operators, in case another build emits them separately.
+    if (fills.has(op) || both.has(op)) {
+      if (isMagentaRgb(state.fill)) found = true;
+      continue;
+    }
+    if (strokes.has(op)) {
+      if (isMagentaRgb(state.stroke)) found = true;
+      continue;
+    }
+
+    // Gradients are not inspected here: pdf.js passes `shadingFill` only a
+    // pattern id, with the colour stops resolved separately through its object
+    // cache. A magenta gradient is instead caught by the rendered-pixel pass.
   }
 
-  return { found, samples: dedupe(samples) };
+  return { found, inText, samples: dedupe(samples) };
 }
 
 function dedupe(values: string[]): string[] {
@@ -382,7 +460,7 @@ export async function processAiDocument(
 
     onProgress?.(`Reading text on artboard ${pageNumber} of ${doc.numPages}...`);
     const texts = await extractPageText(page);
-    const magenta = await findMagentaTextOnPage(page, OPS);
+    const magenta = await findMagentaOnPage(page, OPS);
 
     const blob = await previewBlobFor(canvas, width, height);
 
@@ -395,7 +473,8 @@ export async function processAiDocument(
       blob,
       texts,
       magentaTexts: magenta.samples,
-      hasMagentaText: magenta.found,
+      hasMagenta: magenta.found,
+      magentaInText: magenta.inText,
     });
 
     page.cleanup?.();
