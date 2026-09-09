@@ -8,7 +8,13 @@ import {
   extractTextFromPdfBuffer,
   processAiDocument,
 } from './aiUtils';
-import { findMagentaInObject, isMagentaColor, scanCanvasForMagenta } from './colorUtils';
+import {
+  isMagentaColor,
+  rgbToHex,
+  scanCanvasForMagenta,
+  scanObjectForMagenta,
+} from './colorUtils';
+import type { RgbColor } from './colorUtils';
 import { analyzeQrCodes } from './qrUtils';
 import type { QrScanOutcome } from './qrUtils';
 
@@ -82,6 +88,11 @@ export interface DefaultValueCheck {
   samples: string[];
   /** How the verdict was reached. */
   method: 'layer' | 'vector' | 'pixel' | 'none';
+  /**
+   * When nothing qualified, the closest magenta-family colour that *is* present
+   * — so a near miss can be explained instead of showing a bare dash.
+   */
+  nearest?: { hex: string; source: 'layer' | 'vector' | 'pixel' };
 }
 
 export interface ImageAnalysis {
@@ -843,8 +854,11 @@ function detectMagentaInImage(img: HTMLImageElement): DefaultValueCheck {
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
     const result = scanCanvasForMagenta(canvas);
-    return result.found
-      ? { hasMagenta: true, inText: false, samples: [], method: 'pixel' }
+    if (result.found) {
+      return { hasMagenta: true, inText: false, samples: [], method: 'pixel' };
+    }
+    return result.dominant
+      ? { ...EMPTY_DEFAULT_VALUES, nearest: { hex: rgbToHex(result.dominant.rgb), source: 'pixel' } }
       : EMPTY_DEFAULT_VALUES;
   } catch (err) {
     console.warn('Magenta pixel scan failed:', err);
@@ -871,6 +885,8 @@ interface LayerTextHarvest {
   magentaTexts: string[];
   /** Layers whose artwork (not type) uses magenta, described for the report. */
   magentaLayers: string[];
+  /** Closest magenta-family colour in the tree, when nothing qualified. */
+  nearest: RgbColor | null;
 }
 
 /**
@@ -881,7 +897,7 @@ interface LayerTextHarvest {
  * stops, solid-colour fill layers and anything else ag-psd decodes — which is
  * what "magenta anywhere in the layer" actually requires.
  */
-function magentaArtworkInLayer(layer: Layer): boolean {
+function magentaArtworkInLayer(layer: Layer): { found: boolean; nearest: RgbColor | null } {
   const { text, canvas, imageData, children, mask, ...rest } =
     layer as Layer & Record<string, unknown>;
   void text;
@@ -890,7 +906,8 @@ function magentaArtworkInLayer(layer: Layer): boolean {
   void children;
   void mask;
 
-  return findMagentaInObject(rest).length > 0;
+  const scan = scanObjectForMagenta(rest);
+  return { found: scan.hits.length > 0, nearest: scan.nearest };
 }
 
 /** A readable name for a layer, for reporting where magenta was found. */
@@ -953,6 +970,7 @@ function extractTextFromLayerTree(
   const texts: string[] = [];
   const magentaTexts: string[] = [];
   const magentaLayers: string[] = [];
+  let nearest: RgbColor | null = null;
 
   function walk(items: Layer[]) {
     for (let index = 0; index < items.length; index++) {
@@ -960,8 +978,13 @@ function extractTextFromLayerTree(
 
       // Magenta anywhere in this layer's own properties — a shape fill, a
       // stroke, a layer effect, a gradient stop, a solid-colour fill layer.
-      if (!item.hidden && magentaArtworkInLayer(item)) {
-        magentaLayers.push(describeLayer(item, index));
+      if (!item.hidden) {
+        const artwork = magentaArtworkInLayer(item);
+        if (artwork.found) {
+          magentaLayers.push(describeLayer(item, index));
+        } else if (artwork.nearest && !nearest) {
+          nearest = artwork.nearest;
+        }
       }
 
       // 1. Direct native Photoshop text layer
@@ -1038,6 +1061,7 @@ function extractTextFromLayerTree(
     texts,
     magentaTexts: Array.from(new Set(magentaTexts)),
     magentaLayers: Array.from(new Set(magentaLayers)),
+    nearest,
   };
 }
 
@@ -1344,8 +1368,22 @@ export async function processPsdFile(
         ).slice(0, 8),
         method: 'layer',
       };
-    } else if (scanCanvasForMagenta(canvas).found) {
-      defaultValues = { hasMagenta: true, inText: false, samples: [], method: 'pixel' };
+    } else {
+      const pixels = scanCanvasForMagenta(canvas);
+      if (pixels.found) {
+        defaultValues = { hasMagenta: true, inText: false, samples: [], method: 'pixel' };
+      } else {
+        const near = harvest.nearest ?? pixels.dominant?.rgb ?? null;
+        if (near) {
+          defaultValues = {
+            ...EMPTY_DEFAULT_VALUES,
+            nearest: {
+              hex: rgbToHex(near),
+              source: harvest.nearest ? 'layer' : 'pixel',
+            },
+          };
+        }
+      }
     }
 
     // 7. QR codes on the rendered artboard
@@ -1502,8 +1540,28 @@ export async function processAiFile(
         samples: artboard.magentaTexts.slice(0, 8),
         method: 'vector',
       };
-    } else if (artboard.canvas && scanCanvasForMagenta(artboard.canvas).found) {
-      defaultValues = { hasMagenta: true, inText: false, samples: [], method: 'pixel' };
+    } else {
+      const pixels = artboard.canvas
+        ? scanCanvasForMagenta(artboard.canvas)
+        : null;
+
+      if (pixels?.found) {
+        defaultValues = { hasMagenta: true, inText: false, samples: [], method: 'pixel' };
+      } else {
+        // Nothing qualified. Report the closest magenta-family colour that is
+        // present so the reviewer can see whether the artwork is off-spec
+        // rather than being told nothing at all.
+        const near = artboard.nearestMagenta ?? pixels?.dominant?.rgb ?? null;
+        if (near) {
+          defaultValues = {
+            ...EMPTY_DEFAULT_VALUES,
+            nearest: {
+              hex: rgbToHex(near),
+              source: artboard.nearestMagenta ? 'vector' : 'pixel',
+            },
+          };
+        }
+      }
     }
 
     let status: ImageAnalysis['status'] = 'pass';

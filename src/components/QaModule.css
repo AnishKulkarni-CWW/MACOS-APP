@@ -960,3 +960,19 @@
   max-width: 100%;
   overflow-wrap: anywhere;
 }
+
+/* A near miss: magenta-adjacent, but not the placeholder colour. */
+.qa-default-values.near-miss {
+  background: rgba(148, 163, 184, 0.05);
+  border-color: rgba(148, 163, 184, 0.16);
+}
+
+.qa-default-values.near-miss .qa-default-values-head {
+  color: var(--color-slate);
+}
+
+.qa-default-values.near-miss code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--color-bone);
+}

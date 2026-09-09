@@ -152,22 +152,15 @@ export function normalizeColorToRgb(color: unknown): RgbColor | null {
 }
 
 /**
- * One accepted rendering of "100% magenta", expressed as an HSL window.
+ * An accepted rendering of "magenta", expressed as an HSL window.
  *
- * A single window is not enough, because the same magenta reaches us through
- * different colour pipelines:
- *
- *  - Photoshop text layers and RGB Illustrator documents give us sRGB #FF00FF
- *    (hue 300).
- *  - A CMYK Illustrator document does not. Typing #FF00FF into the colour
- *    picker of a CMYK document makes Illustrator convert it through the working
- *    profile, so what lands in the file is a magenta-dominant ink mix such as
- *    0/100/0/0, 8/98/0/0 or 17/91/0/0 — and pdf.js then converts *that* back to
- *    RGB with its DeviceCMYK approximation. Measured across that spread the
- *    results land between hue 316 and 337 at saturations as low as 0.62.
- *
- * The lightness ceilings are what separate a full-strength magenta from a light
- * tint: CMYK 0/50/0/0 renders at lightness 0.80 and must not be flagged.
+ * A literal `#FF00FF` test does not survive contact with real artwork. Two
+ * conversions sit between the designer's colour picker and this code:
+ * Illustrator converts on input (typing `#FF00FF` into a CMYK document stores a
+ * magenta-dominant ink mix such as `17/91/0/0`), and pdf.js converts again on
+ * output. Measured across that spread the results land anywhere between hue
+ * 316° and 337° at saturations as low as 0.62 — and a spot magenta with an RGB
+ * alternate lands at hue 324° / lightness 0.46.
  */
 export interface MagentaAnchor {
   label: string;
@@ -183,58 +176,60 @@ export interface MagentaAnchor {
 }
 
 /**
- * Anchors for structured colour data — a PSD text layer's fillColor, or the
+ * The window used for structured colour data — a PSD layer's colour, or the
  * fill pdf.js reports for an Illustrator object.
+ *
+ * Deliberately generous. Structured colour comes from artwork the designer
+ * placed, so the realistic false positive is a brand colour that happens to be
+ * magenta-ish; BMW's palette is blue, black, white and grey, so that risk is
+ * near zero. Missing a placeholder because a colour profile shifted it a few
+ * degrees is the far more expensive error.
+ *
+ * It still stops short of neighbouring families: crimson (hue 348) is out, so
+ * are purples below saturation 0.45, and — importantly — a light magenta tint.
+ * CMYK `0/50/0/0` renders at lightness 0.80, above the ceiling, so a 50% tint is
+ * never mistaken for a full-strength placeholder.
  */
 export const STRUCTURED_ANCHORS: MagentaAnchor[] = [
   {
-    label: 'sRGB #FF00FF',
-    hue: 300,
-    hueTolerance: 14,
-    minSaturation: 0.7,
-    minLightness: 0.3,
-    maxLightness: 0.72,
-  },
-  {
-    // Covers every CMYK magenta measured through pdf.js: 0/100/0/0 -> #FB3199,
-    // 17/91/0/0 -> #D341A0, 25/100/0/0 -> #C12D98, 0/100/20/0 -> #FD2F7F, and
-    // spot magenta with an RGB alternate -> #EB008C.
-    label: 'CMYK magenta (converted)',
-    hue: 327,
-    hueTolerance: 12,
-    minSaturation: 0.6,
-    minLightness: 0.4,
-    maxLightness: 0.68,
+    label: 'magenta family',
+    hue: 316,
+    hueTolerance: 28,
+    minSaturation: 0.45,
+    minLightness: 0.25,
+    maxLightness: 0.78,
   },
 ];
 
 /**
- * Anchors for sampled pixels. Deliberately tighter than the structured windows:
- * this path only runs when no layer/vector colour was found, and BMW artwork is
- * full of sunset photography whose pinks would otherwise be mistaken for
- * placeholder copy.
+ * The window used to recognise *unmistakable* magenta in rendered pixels.
+ *
+ * Pixels are a much noisier signal than layer data — BMW artwork is full of
+ * sunset photography whose pinks sit in the same hue range — so this pass only
+ * accepts near-pure magenta on colour alone. Anything less certain has to prove
+ * itself flat as well (see {@link scanCanvasForMagenta}).
  */
 export const PIXEL_ANCHORS: MagentaAnchor[] = [
   {
     label: 'sRGB #FF00FF',
     hue: 300,
-    hueTolerance: 8,
-    minSaturation: 0.85,
-    minLightness: 0.38,
-    maxLightness: 0.62,
+    hueTolerance: 10,
+    minSaturation: 0.8,
+    minLightness: 0.35,
+    maxLightness: 0.65,
   },
   {
     label: 'CMYK magenta (converted)',
     hue: 328,
-    hueTolerance: 6,
-    minSaturation: 0.8,
-    minLightness: 0.45,
-    maxLightness: 0.64,
+    hueTolerance: 8,
+    minSaturation: 0.75,
+    minLightness: 0.42,
+    maxLightness: 0.66,
   },
 ];
 
 /** Circular hue distance in degrees. */
-function hueDistance(a: number, b: number): number {
+export function hueDistance(a: number, b: number): number {
   const raw = Math.abs(a - b) % 360;
   return raw > 180 ? 360 - raw : raw;
 }
@@ -257,6 +252,23 @@ export function isMagentaRgb(
       l >= anchor.minLightness &&
       l <= anchor.maxLightness
   );
+}
+
+/** `#rrggbb` for an RGB triple. */
+export function rgbToHex({ r, g, b }: RgbColor): string {
+  const hex = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+  return `#${hex(r)}${hex(g)}${hex(b)}`;
+}
+
+/**
+ * How far a colour sits from the magenta family, for reporting a near miss.
+ * Returns null for colours that are not even in the neighbourhood.
+ */
+export function magentaProximity(rgb: RgbColor): number | null {
+  const { h, s, l } = rgbToHsl(rgb.r, rgb.g, rgb.b);
+  if (s < 0.25 || l < 0.15 || l > 0.9) return null;
+  const distance = hueDistance(h, 316);
+  return distance <= 45 ? distance : null;
 }
 
 /**
@@ -303,58 +315,166 @@ export function isMagentaColor(
   return isMagentaRgb(normalizeColorToRgb(color), anchors);
 }
 
+export interface MagentaPixelScan {
+  found: boolean;
+  /** Why it was flagged — or 'none'. */
+  reason: 'pure' | 'flat-region' | 'none';
+  /** Pixels of the dominant magenta-family colour (scaled back to full frame). */
+  pixelCount: number;
+  /**
+   * The most-used colour from the magenta family on this canvas, whether or not
+   * it was flagged. Reported so a near miss can be shown to the reviewer
+   * instead of leaving them with an unexplained dash.
+   */
+  dominant: { rgb: RgbColor; count: number } | null;
+}
+
+const NO_PIXEL_MAGENTA: MagentaPixelScan = {
+  found: false,
+  reason: 'none',
+  pixelCount: 0,
+  dominant: null,
+};
+
 /**
- * Scan rendered pixels for magenta. Used as a fallback when an asset carries no
- * structured text colour information (flattened rasters, rasterised artboards).
+ * Scan rendered pixels for placeholder magenta.
  *
- * Guarded on both sides:
- *  - at least `minPixels` magenta pixels, so single stray pixels are ignored
- *  - at most `maxCoverage` of the image, so a magenta background/graphic panel
- *    is not mistaken for placeholder copy
+ * This is the fallback for artwork whose colour cannot be read structurally —
+ * a flattened raster, a gradient (pdf.js resolves those through a separate
+ * pattern object), or type that a transparency flatten turned into an image.
+ *
+ * The hard part is that BMW campaign photography — sunsets especially — lives
+ * in the same hue range as magenta, so colour alone cannot decide. Two passes
+ * run instead:
+ *
+ *  1. **Pure** — pixels matching the tight {@link PIXEL_ANCHORS}. Near-pure
+ *     magenta does not occur in natural light, so a small count is conclusive.
+ *  2. **Flat region** — for the wider magenta family, pixels are counted per
+ *     exact RGB value. A vector fill paints thousands of pixels of one identical
+ *     value, with only anti-aliased edges around it; a photographic gradient
+ *     spreads its pixels evenly across neighbouring values. Comparing the most
+ *     common value against its immediate neighbours separates the two cleanly.
  */
 export function scanCanvasForMagenta(
   canvas: HTMLCanvasElement,
-  options: { minPixels?: number; maxCoverage?: number } = {}
-): { found: boolean; pixelCount: number; coverage: number } {
-  const minPixels = options.minPixels ?? 24;
-  const maxCoverage = options.maxCoverage ?? 0.06;
+  options: { minPurePixels?: number; minFlatPixels?: number; flatRatio?: number } = {}
+): MagentaPixelScan {
+  const minPurePixels = options.minPurePixels ?? 24;
+  const minFlatPixels = options.minFlatPixels ?? 120;
+  const flatRatio = options.flatRatio ?? 6;
 
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx || canvas.width === 0 || canvas.height === 0) {
-    return { found: false, pixelCount: 0, coverage: 0 };
-  }
+  if (!ctx || canvas.width === 0 || canvas.height === 0) return NO_PIXEL_MAGENTA;
 
   let data: Uint8ClampedArray;
   try {
     data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
   } catch {
     // Tainted canvas (cross-origin source) — cannot sample.
-    return { found: false, pixelCount: 0, coverage: 0 };
+    return NO_PIXEL_MAGENTA;
   }
 
   const totalPixels = canvas.width * canvas.height;
-  // Sample every Nth pixel on large canvases to keep this fast on big batches.
-  const step = totalPixels > 4_000_000 ? 4 : totalPixels > 1_000_000 ? 2 : 1;
+  const step = totalPixels > 4_000_000 ? 2 : 1;
+  const scale = step; // sampled counts represent `step` real pixels each
 
-  let count = 0;
-  let sampled = 0;
+  const histogram = new Map<number, number>();
+  const HISTOGRAM_LIMIT = 250_000;
+
   for (let i = 0; i < data.length; i += 4 * step) {
-    const a = data[i + 3];
-    if (a < 128) continue;
-    sampled++;
-    if (isMagentaRgb({ r: data[i], g: data[i + 1], b: data[i + 2] }, PIXEL_ANCHORS)) {
-      count++;
-    }
+    if (data[i + 3] < 128) continue;
+
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    if (!isMagentaRgb({ r, g, b }, STRUCTURED_ANCHORS)) continue;
+
+    const key = (r << 16) | (g << 8) | b;
+    const seen = histogram.get(key);
+    if (seen !== undefined) histogram.set(key, seen + 1);
+    else if (histogram.size < HISTOGRAM_LIMIT) histogram.set(key, 1);
   }
 
-  const scaledCount = count * step;
-  const coverage = sampled > 0 ? count / sampled : 0;
+  const unpack = (key: number): RgbColor => ({
+    r: (key >> 16) & 0xff,
+    g: (key >> 8) & 0xff,
+    b: key & 0xff,
+  });
 
-  return {
-    found: scaledCount >= minPixels && coverage <= maxCoverage,
-    pixelCount: scaledCount,
-    coverage,
+  /**
+   * How far a value stands above the colours immediately surrounding it.
+   *
+   * The whole ±1 cube is checked, not one channel at a time: a ramp moves all
+   * three channels together, so its neighbouring band sits at something like
+   * (+1, +1, −1) and a single-axis probe would find nothing there and wrongly
+   * call the band flat.
+   */
+  const isFlat = (key: number, count: number): boolean => {
+    const { r, g, b } = unpack(key);
+    let neighbourMax = 0;
+
+    for (let dr = -1; dr <= 1; dr++) {
+      const nr = r + dr;
+      if (nr < 0 || nr > 255) continue;
+      for (let dg = -1; dg <= 1; dg++) {
+        const ng = g + dg;
+        if (ng < 0 || ng > 255) continue;
+        for (let db = -1; db <= 1; db++) {
+          if (dr === 0 && dg === 0 && db === 0) continue;
+          const nb = b + db;
+          if (nb < 0 || nb > 255) continue;
+          const neighbour = histogram.get((nr << 16) | (ng << 8) | nb) ?? 0;
+          if (neighbour > neighbourMax) neighbourMax = neighbour;
+        }
+      }
+    }
+
+    return count > flatRatio * (neighbourMax + 1);
   };
+
+  // Track the most-used family colour for reporting, and separately look for a
+  // flat region. They are not the same thing: a photographic gradient can easily
+  // out-count a small flat price, so scanning only the most common colour would
+  // miss the placeholder sitting on top of it.
+  let dominantKey = -1;
+  let dominantCount = 0;
+  let hit: { key: number; count: number; pure: boolean } | null = null;
+
+  const smallestThreshold = Math.min(minPurePixels, minFlatPixels);
+
+  for (const [key, count] of histogram) {
+    if (count > dominantCount) {
+      dominantCount = count;
+      dominantKey = key;
+    }
+
+    const realCount = count * scale;
+    if (realCount < smallestThreshold) continue;
+
+    // Flatness is required of pure magenta too. A gradient sweeping through the
+    // magenta hues passes near-pure values for thousands of pixels, and colour
+    // alone cannot tell that apart from a placeholder fill.
+    if (!isFlat(key, count)) continue;
+
+    const pure = isMagentaRgb(unpack(key), PIXEL_ANCHORS);
+    if (realCount < (pure ? minPurePixels : minFlatPixels)) continue;
+
+    if (!hit || count > hit.count) hit = { key, count, pure };
+  }
+
+  const dominant =
+    dominantKey >= 0 ? { rgb: unpack(dominantKey), count: dominantCount * scale } : null;
+
+  if (hit) {
+    return {
+      found: true,
+      reason: hit.pure ? 'pure' : 'flat-region',
+      pixelCount: hit.count * scale,
+      dominant,
+    };
+  }
+
+  return { found: false, reason: 'none', pixelCount: 0, dominant };
 }
 
 /**
@@ -394,6 +514,12 @@ export interface MagentaHit {
   rgb: RgbColor;
 }
 
+export interface ObjectColorScan {
+  hits: MagentaHit[];
+  /** Closest magenta-family colour that did *not* qualify, for diagnostics. */
+  nearest: RgbColor | null;
+}
+
 /**
  * Walk an arbitrary object graph and collect every magenta colour in it.
  *
@@ -401,15 +527,17 @@ export interface MagentaHit {
  * a fixed list of properties — a magenta text fill, a magenta layer effect, a
  * magenta shape fill and a magenta gradient stop all surface the same way.
  */
-export function findMagentaInObject(
+export function scanObjectForMagenta(
   root: unknown,
   options: { maxDepth?: number; maxNodes?: number } = {}
-): MagentaHit[] {
+): ObjectColorScan {
   const maxDepth = options.maxDepth ?? 8;
   const maxNodes = options.maxNodes ?? 20000;
 
   const hits: MagentaHit[] = [];
   let visited = 0;
+  let nearest: RgbColor | null = null;
+  let nearestDistance = Infinity;
   const seen = new Set<object>();
 
   const walk = (value: unknown, path: string, depth: number) => {
@@ -427,9 +555,18 @@ export function findMagentaInObject(
     if ((value as Record<string, unknown>).disabled === true) return;
 
     if (looksLikeColor(value)) {
+      const rgb = normalizeColorToRgb(value);
+      if (!rgb) return;
+
       if (isMagentaColor(value)) {
-        const rgb = normalizeColorToRgb(value);
-        if (rgb) hits.push({ path, rgb });
+        hits.push({ path, rgb });
+        return;
+      }
+
+      const distance = magentaProximity(rgb);
+      if (distance !== null && distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = rgb;
       }
       return;
     }
@@ -448,5 +585,5 @@ export function findMagentaInObject(
   };
 
   walk(root, '', 0);
-  return hits;
+  return { hits, nearest };
 }
