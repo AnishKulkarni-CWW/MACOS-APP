@@ -145,6 +145,29 @@ const BMW_WHITELIST = new Set([
   // Common brand partners / terms
   'harman', 'kardon', 'bowers', 'wilkins', 'pirelli', 'michelin',
   'bridgestone', 'continental',
+
+  // Contact-block abbreviations that appear in every dealer panel
+  'tel', 'telephone', 'fax', 'mob', 'ext', 'ph', 'pvt', 'ltd', 'llp',
+  'inc', 'opp', 'nr', 'rd', 'ave', 'blvd', 'marg', 'nagar', 'puram',
+
+  // Indian currency & finance vocabulary used across BMW India pricing
+  'lakh', 'lakhs', 'crore', 'crores', 'rupee', 'rupees', 'roi', 'tcs', 'tds',
+  'onwards', 'ex', 'showroom',
+
+  // Indian cities, states and the Mumbai localities BMW dealer panels list
+  'india', 'mumbai', 'navi', 'worli', 'nariman', 'andheri', 'malad', 'bandra',
+  'thane', 'powai', 'chembur', 'borivali', 'kurla', 'dadar', 'colaba',
+  'delhi', 'gurgaon', 'gurugram', 'noida', 'bengaluru', 'bangalore',
+  'chennai', 'hyderabad', 'kolkata', 'pune', 'ahmedabad', 'jaipur',
+  'lucknow', 'chandigarh', 'kochi', 'surat', 'indore', 'nagpur',
+  'coimbatore', 'vadodara', 'bhubaneswar', 'guwahati', 'goa', 'kerala',
+  'punjab', 'haryana', 'gujarat', 'maharashtra', 'karnataka', 'telangana',
+
+  // BMW India dealer groups
+  'navnit', 'infinity', 'deutsche', 'motoren', 'bavaria', 'parsn', 'kun',
+
+  // Marketing compounds that a plain lexicon misses
+  'buyback', 'downpayment', 'roadside', 'testdrive', 'preowned',
 ]);
 
 // ============================================
@@ -409,7 +432,10 @@ export async function terminateOCRWorker(): Promise<void> {
  */
 function tokenize(text: string): { word: string; index: number }[] {
   const tokens: { word: string; index: number }[] = [];
-  const regex = /[a-zA-Z''-]+/g;
+  // Hyphens are separators, not part of a word. Keeping them inside the token
+  // meant "state-of-the-art" was looked up whole (and always missed), and a
+  // domain like "bmw-infinitycars" was reported as one misspelled word.
+  const regex = /[a-zA-Z‘’']+/g;
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(text)) !== null) {
@@ -438,6 +464,93 @@ function shouldSkipWord(word: string): boolean {
   return false;
 }
 
+// --------------------------------------------
+// Non-prose masking
+// --------------------------------------------
+// Dealer panels are the single biggest source of false spelling flags: they are
+// nothing but proper nouns, abbreviations, phone numbers and URLs. None of that
+// is prose, so none of it should reach the dictionary.
+
+/** A web address or bare domain, with or without a scheme. */
+const URL_PATTERN =
+  /\b(?:https?:\/\/|www\.)\S+|\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|net|org|in|io|me|co|de|info|biz|edu|gov)\b\S*/gi;
+
+/** An email address. */
+const EMAIL_PATTERN = /\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/gi;
+
+/** A dialable number: at least 8 digits once separators are ignored. */
+const PHONE_PATTERN = /\+?\d[\d\s().-]{6,}\d/;
+
+/**
+ * Does this line carry contact data rather than copy?
+ */
+function isContactLine(line: string): boolean {
+  URL_PATTERN.lastIndex = 0;
+  EMAIL_PATTERN.lastIndex = 0;
+  return URL_PATTERN.test(line) || EMAIL_PATTERN.test(line) || PHONE_PATTERN.test(line);
+}
+
+/**
+ * Is this a short label line made of proper names?
+ *
+ * Dealer panels are laid out as stacked labels — "Worli", "Nariman Point",
+ * "BMW Infinity Cars", "BMW Navnit Motors Andheri" — which no general
+ * dictionary will ever contain. They are recognised by shape rather than by
+ * listing every Indian locality:
+ *
+ *   - at most five words, which covers the longest dealer lines
+ *     ("BMW Infinity Cars Nariman Point") without reaching running copy;
+ *   - every word Title-Case or ALL-CAPS, so a single lowercase word ("with",
+ *     "at", "up") marks the line as prose and keeps it checked;
+ *   - at least one Title-Case word, so ALL-CAPS headlines stay checked;
+ *   - no sentence-ending punctuation, which again marks prose.
+ *
+ * The trade-off is deliberate: a short Title-Case line such as "Sheer Driving
+ * Pleasure" is treated as a name and skipped. Those lines are brand lockups in
+ * practice, and letting a dealer panel spray a dozen false flags over every
+ * report costs far more than the rare missed typo in one.
+ */
+function isProperNameLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) return false;
+
+  // Sentence punctuation means prose.
+  if (/[.!?]["'’)\]]*$/.test(trimmed)) return false;
+
+  const words = trimmed.match(/[A-Za-z][A-Za-z‘’']*/g);
+  if (!words || words.length === 0 || words.length > 5) return false;
+
+  let titleCase = 0;
+  for (const word of words) {
+    const isTitle = /^[A-Z][a-z‘’']+$/.test(word);
+    const isAllCaps = /^[A-Z]+$/.test(word);
+    if (!isTitle && !isAllCaps) return false;
+    if (isTitle) titleCase++;
+  }
+
+  return titleCase > 0;
+}
+
+/**
+ * Blank out everything that is not prose, replacing it with spaces.
+ *
+ * Masking rather than deleting keeps every character index identical to the
+ * original text, so the context shown next to a flagged word stays accurate.
+ */
+function maskNonProse(text: string): string {
+  const blank = (match: string) => ' '.repeat(match.length);
+
+  return text
+    .split('\n')
+    .map((line) => {
+      if (isContactLine(line) || isProperNameLine(line)) {
+        return ' '.repeat(line.length);
+      }
+      return line.replace(URL_PATTERN, blank).replace(EMAIL_PATTERN, blank);
+    })
+    .join('\n');
+}
+
 /**
  * Get surrounding context for a word in text
  */
@@ -458,7 +571,7 @@ function getWordContext(text: string, index: number, word: string): string {
 export function checkSpelling(text: string): SpellingIssue[] {
   if (!text || text.trim().length === 0) return [];
 
-  const tokens = tokenize(text);
+  const tokens = tokenize(maskNonProse(text));
   const issues: SpellingIssue[] = [];
   const alreadyFlagged = new Set<string>();
 
@@ -1327,7 +1440,9 @@ export async function processAiFile(
 
     // 4. Default values — magenta fills on the vector text.
     let defaultValues: DefaultValueCheck = EMPTY_DEFAULT_VALUES;
-    if (artboard.magentaTexts.length > 0) {
+    if (artboard.hasMagentaText) {
+      // Samples can legitimately be empty — an unreadable subset font does not
+      // make the magenta any less present.
       defaultValues = {
         hasMagentaText: true,
         samples: artboard.magentaTexts.slice(0, 8),

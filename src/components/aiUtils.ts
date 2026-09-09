@@ -20,7 +20,7 @@
 // lists throw and every artboard comes back blank.
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import { inflate, inflateRaw } from 'pako';
-import { isMagentaRgb, type RgbColor } from './colorUtils';
+import { isMagentaCmyk, isMagentaRgb, type RgbColor } from './colorUtils';
 
 // ============================================
 // pdf.js bootstrap
@@ -57,6 +57,10 @@ export interface AiArtboard {
   texts: string[];
   /** Text runs painted in magenta (#FF00FF) — i.e. untouched default values. */
   magentaTexts: string[];
+  /**
+   * True when magenta text was painted on the artboard. Independent of
+   * `magentaTexts`, which stays empty when the glyphs cannot be read back.
+   */
   hasMagentaText: boolean;
 }
 
@@ -156,72 +160,104 @@ function glyphsToString(glyphs: unknown): string {
   return out;
 }
 
+/** What a page-level magenta scan found. */
+export interface MagentaScan {
+  /** True when magenta text was painted, whether or not it could be read. */
+  found: boolean;
+  /** Readable samples of that text, when the glyphs map back to characters. */
+  samples: string[];
+}
+
 /**
- * Walk a page's operator list tracking the active fill colour, and collect the
- * text drawn while that colour is magenta.
+ * Walk a page's operator list tracking the active colours, and report the text
+ * drawn in magenta.
  *
- * pdf.js normalises every fill-colour operator (rg / k / g / sc / scn) into
- * `setFillRGBColor` carrying a single `#rrggbb` string, which makes this a
- * colour-space-independent check.
+ * pdf.js normalises every colour operator (rg / k / g / sc / scn) into
+ * `setFillRGBColor` / `setStrokeRGBColor` carrying a single `#rrggbb` string,
+ * so this reads whatever colour space Illustrator used.
+ *
+ * `found` is deliberately independent of `samples`: a subset font with a custom
+ * encoding can leave glyphs with no usable unicode mapping, and a price like
+ * "₹59,999*" would then decode to nothing. The artboard still has magenta text
+ * on it, so it must still be flagged — we just cannot quote it.
  */
 async function findMagentaTextOnPage(page: {
   getOperatorList: () => Promise<{ fnArray: number[]; argsArray: unknown[][] }>;
-}, OPS: Record<string, number>): Promise<string[]> {
+}, OPS: Record<string, number>): Promise<MagentaScan> {
   let opList: { fnArray: number[]; argsArray: unknown[][] };
   try {
     opList = await page.getOperatorList();
   } catch (err) {
     console.warn('Could not read AI operator list for colour analysis:', err);
-    return [];
+    return { found: false, samples: [] };
   }
 
-  const found: string[] = [];
+  const samples: string[] = [];
+  let found = false;
 
-  let fill: RgbColor | null = null;
-  let textRenderMode = 0;
-  const stack: { fill: RgbColor | null; textRenderMode: number }[] = [];
+  interface GraphicsState {
+    fill: RgbColor | null;
+    stroke: RgbColor | null;
+    textRenderMode: number;
+  }
+
+  let state: GraphicsState = { fill: null, stroke: null, textRenderMode: 0 };
+  const stack: GraphicsState[] = [];
 
   for (let i = 0; i < opList.fnArray.length; i++) {
     const op = opList.fnArray[i];
     const args = opList.argsArray[i];
 
     if (op === OPS.save) {
-      stack.push({ fill, textRenderMode });
+      stack.push({ ...state });
       continue;
     }
     if (op === OPS.restore) {
       const prev = stack.pop();
-      if (prev) {
-        fill = prev.fill;
-        textRenderMode = prev.textRenderMode;
-      }
+      if (prev) state = prev;
       continue;
     }
     if (op === OPS.setFillRGBColor) {
       const value = args?.[0];
-      fill = typeof value === 'string' ? hexToRgb(value) : null;
+      state.fill = typeof value === 'string' ? hexToRgb(value) : null;
+      continue;
+    }
+    if (op === OPS.setStrokeRGBColor) {
+      const value = args?.[0];
+      state.stroke = typeof value === 'string' ? hexToRgb(value) : null;
       continue;
     }
     if (op === OPS.setFillTransparent) {
-      fill = null;
+      state.fill = null;
       continue;
     }
     if (op === OPS.setTextRenderingMode) {
       const mode = args?.[0];
-      textRenderMode = typeof mode === 'number' ? mode : 0;
+      state.textRenderMode = typeof mode === 'number' ? mode : 0;
       continue;
     }
     if (op === OPS.showText) {
+      const mode = state.textRenderMode;
       // 3 = invisible, 7 = clip-only. Neither is visible placeholder copy.
-      if (textRenderMode === 3 || textRenderMode === 7) continue;
-      if (!isMagentaRgb(fill)) continue;
+      if (mode === 3 || mode === 7) continue;
+
+      // Modes 0/2/4/6 paint the fill; 1/5 paint the stroke only.
+      const paintsFill = mode !== 1 && mode !== 5;
+      const paintsStroke = mode === 1 || mode === 2 || mode === 5 || mode === 6;
+
+      const isMagenta =
+        (paintsFill && isMagentaRgb(state.fill)) ||
+        (paintsStroke && isMagentaRgb(state.stroke));
+      if (!isMagenta) continue;
+
+      found = true;
 
       const text = glyphsToString(args?.[0]).trim();
-      if (text.length > 0) found.push(text);
+      if (text.length > 0) samples.push(text);
     }
   }
 
-  return dedupe(found);
+  return { found, samples: dedupe(samples) };
 }
 
 function dedupe(values: string[]): string[] {
@@ -346,7 +382,7 @@ export async function processAiDocument(
 
     onProgress?.(`Reading text on artboard ${pageNumber} of ${doc.numPages}...`);
     const texts = await extractPageText(page);
-    const magentaTexts = await findMagentaTextOnPage(page, OPS);
+    const magenta = await findMagentaTextOnPage(page, OPS);
 
     const blob = await previewBlobFor(canvas, width, height);
 
@@ -358,8 +394,8 @@ export async function processAiDocument(
       canvas,
       blob,
       texts,
-      magentaTexts,
-      hasMagentaText: magentaTexts.length > 0,
+      magentaTexts: magenta.samples,
+      hasMagentaText: magenta.found,
     });
 
     page.cleanup?.();
@@ -453,9 +489,17 @@ function decompressPdfStreams(data: Uint8Array): string[] {
   return streams;
 }
 
-/** Keep printable marketing copy, drop binary font/glyph noise. */
+/**
+ * Keep printable marketing copy, drop binary font/glyph noise.
+ *
+ * The allowed set has to cover real ad copy, which includes prices and legal
+ * marks — "₹59,999*" and "up to ₹1.5 Lakh*" were previously discarded as noise.
+ */
 function isPrintableCopy(text: string): boolean {
-  return text.length > 0 && /^[a-zA-Z0-9\s.,!?:;'"“”\-–—/()&%]+$/.test(text);
+  return (
+    text.length > 0 &&
+    /^[a-zA-Z0-9\s.,!?:;'"“”\-–—/()&%*+@#°₹$€£¥~_[\]{}|=<>]+$/.test(text)
+  );
 }
 
 /**
@@ -470,60 +514,48 @@ function findMagentaTextInStream(stream: string): string[] {
     /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+k(?![a-zA-Z])|(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+rg(?![a-zA-Z])|(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+scn(?![a-zA-Z])|(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+scn(?![a-zA-Z])|(-?[\d.]+)\s+g(?![a-zA-Z])|\[([\s\S]*?)\]\s*TJ(?![a-zA-Z])|\(((?:\\.|[^\\()])*)\)\s*Tj(?![a-zA-Z])/g;
 
   const found: string[] = [];
-  let fill: RgbColor | null = null;
+  // The stream carries the original ink values, so CMYK fills are judged in ink
+  // space and only RGB fills go through the HSL anchors.
+  let fillIsMagenta = false;
   let match: RegExpExecArray | null;
 
-  const toByte = (v: string) => Math.round(Math.max(0, Math.min(1, parseFloat(v))) * 255);
+  const num = (v: string) => Math.max(0, Math.min(1, parseFloat(v)));
+  const toByte = (v: string) => Math.round(num(v) * 255);
+  const rgbFill = (r: string, g: string, b: string) =>
+    isMagentaRgb({ r: toByte(r), g: toByte(g), b: toByte(b) } as RgbColor);
 
   while ((match = OP_RE.exec(stream)) !== null) {
     // CMYK: "c m y k k"
     if (match[1] !== undefined) {
-      const c = parseFloat(match[1]);
-      const m = parseFloat(match[2]);
-      const y = parseFloat(match[3]);
-      const k = parseFloat(match[4]);
-      fill = {
-        r: Math.round(255 * (1 - Math.min(1, c)) * (1 - Math.min(1, k))),
-        g: Math.round(255 * (1 - Math.min(1, m)) * (1 - Math.min(1, k))),
-        b: Math.round(255 * (1 - Math.min(1, y)) * (1 - Math.min(1, k))),
-      };
+      fillIsMagenta = isMagentaCmyk(num(match[1]), num(match[2]), num(match[3]), num(match[4]));
       continue;
     }
 
     // RGB: "r g b rg"
     if (match[5] !== undefined) {
-      fill = { r: toByte(match[5]), g: toByte(match[6]), b: toByte(match[7]) };
+      fillIsMagenta = rgbFill(match[5], match[6], match[7]);
       continue;
     }
 
     // scn with 4 components — treat as CMYK
     if (match[8] !== undefined) {
-      const c = parseFloat(match[8]);
-      const m = parseFloat(match[9]);
-      const y = parseFloat(match[10]);
-      const k = parseFloat(match[11]);
-      fill = {
-        r: Math.round(255 * (1 - Math.min(1, c)) * (1 - Math.min(1, k))),
-        g: Math.round(255 * (1 - Math.min(1, m)) * (1 - Math.min(1, k))),
-        b: Math.round(255 * (1 - Math.min(1, y)) * (1 - Math.min(1, k))),
-      };
+      fillIsMagenta = isMagentaCmyk(num(match[8]), num(match[9]), num(match[10]), num(match[11]));
       continue;
     }
 
     // scn with 3 components — treat as RGB
     if (match[12] !== undefined) {
-      fill = { r: toByte(match[12]), g: toByte(match[13]), b: toByte(match[14]) };
+      fillIsMagenta = rgbFill(match[12], match[13], match[14]);
       continue;
     }
 
-    // Gray: "g g"
+    // Gray: "g g" — never magenta.
     if (match[15] !== undefined) {
-      const v = toByte(match[15]);
-      fill = { r: v, g: v, b: v };
+      fillIsMagenta = false;
       continue;
     }
 
-    if (!isMagentaRgb(fill)) continue;
+    if (!fillIsMagenta) continue;
 
     // TJ array
     if (match[16] !== undefined) {
