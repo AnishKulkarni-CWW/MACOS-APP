@@ -190,8 +190,9 @@ An automated Quality Assurance powerhouse that checks design assets against BMW 
    - Minimum text height set to `0.0` to detect fine legal disclaimers and micro-footnotes.
 4. **Proprietary Spell Checking & Whitelist Engine**:
    - 2.49 MB full offline English dictionary (`en_words.txt`).
-   - BMW-specific whitelist covering model series, electric vehicle lines, proprietary technologies, and automotive terminology.
+   - BMW-specific whitelist covering model series, electric vehicle lines, proprietary technologies, automotive terminology, Indian localities and currency vocabulary, and dealer-panel abbreviations.
    - 40+ comprehensive morphological stemming rules.
+   - **Non-prose masking**: dealer panels, URLs, email addresses and phone numbers are excluded before the dictionary is consulted, so proper nouns and contact data no longer produce false flags.
 5. **Multi-Artboard Illustrator Inspection**:
    - Reads the PDF-compatible stream of an `.ai` file, treating each PDF page as one Illustrator artboard.
    - Reports true artboard dimensions and renders every artboard at high resolution for preview and machine inspection.
@@ -204,6 +205,8 @@ An automated Quality Assurance powerhouse that checks design assets against BMW 
 7. **Default Value Detection** (`Default Values` column):
    - Flags any artboard still carrying text in the BMW placeholder magenta — `#FF00FF` / `rgb(255, 0, 255)` / `cmyk(0, 100, 0, 0)` / `hsl(300, 100%, 50%)`.
    - Reads the colour from the layer data rather than guessing from pixels: PSD text-layer `fillColor` (including per-range style runs), AI/PDF fill operators, and the streams of embedded AI smart objects. Rendered pixels are only sampled as a last resort, for fully rasterised assets.
+   - Works in **CMYK documents as well as RGB ones**. Typing `#FF00FF` into the colour picker of a CMYK Illustrator file makes Illustrator convert it through the working profile, so what is actually stored is a magenta-dominant ink mix (`0/100/0/0`, `8/98/0/0`, `17/91/0/0`, …) rather than the literal hex — all of which are recognised.
+   - Flagging does not depend on being able to quote the copy: a subsetted font with no usable character mapping still raises the flag, it simply reports no sample text.
    - Marked **✅ Default Text** when placeholder copy is present, or **—** when the artboard is clean. The expanded row lists the exact offending strings.
 8. **Interactive QC Reporting**:
    - **Single Image Mode**: Technical specs (width, height, aspect ratio, color depth, file size), OCR confidence meter, full extracted copy, and itemized flagged issues with surrounding sentence context.
@@ -476,14 +479,24 @@ An `.ai` file saved with PDF compatibility *is* a PDF, one page per artboard, so
 3. **Destination Test**: the hostname of both the original and final URL is split on `.`; an `in` segment means an Indian destination. This matches `bmw.in` and `bmw.co.in` as well as `in.bmw.com`, while correctly leaving `linkedin.com` and `india.com` alone.
 
 ### Magenta Placeholder ("Default Values") Detection
-`src/components/colorUtils.ts` normalises every colour shape the pipeline can produce — RGB/RGBA (0–255), FRGB (0–1), CMYK, HSB, Grayscale — into plain RGB, then tests it in HSL space against a set of anchors rather than a single hard-coded hex:
+Testing for `#FF00FF` literally does not work, because the placeholder rarely survives as that hex. Two conversions sit between the designer's colour picker and the detector:
 
-| Anchor | Rendered as | Why it is needed |
+1. **Illustrator converts on input.** In a CMYK document, typing `#FF00FF` is converted through the working profile, so the file stores an ink mix such as `0/100/0/0`, `8/98/0/0` or `17/91/0/0`.
+2. **pdf.js converts on output.** Reading that back gives an approximated RGB — `#FB3199`, `#E9349B`, `#D341A0` respectively, spanning hue 316°–337° at saturations down to 0.62.
+
+`src/components/colorUtils.ts` therefore works two ways:
+
+- **Ink space, when the original CMYK survives** (a raw AI/PDF content stream, or a PSD text layer stored in CMYK). `isMagentaCmyk()` asks the question directly — the magenta plate is strong (M ≥ 0.75), the others are near-empty (C ≤ 0.35, Y ≤ 0.25, K ≤ 0.25) and magenta dominates them by a clear margin. No colour conversion is involved, so no approximation can distort the answer.
+- **HSL anchors, when only converted RGB is available.** Every other colour shape (RGB/RGBA, FRGB, HSB, Grayscale) is normalised to RGB and tested against anchors sized from the measured conversion spread:
+
+| Anchor | Covers | Window |
 | :--- | :--- | :--- |
-| sRGB magenta | `#FF00FF` (hue 300°) | Photoshop text layers and RGB Illustrator documents. |
-| DeviceCMYK magenta | `#FB3199` (hue 329°) | pdf.js converts `0/100/0/0` with the calibrated profile PDF viewers use — a CMYK master would never match a plain hue-300 test. |
+| sRGB magenta | Photoshop text layers, RGB Illustrator documents | hue 300° ± 14°, S ≥ 0.70, L 0.30–0.72 |
+| CMYK magenta (converted) | Every CMYK ink mix above, plus spot magenta with an RGB alternate (`#EB008C`) | hue 327° ± 12°, S ≥ 0.60, L 0.40–0.68 |
 
-Each anchor carries its own hue, saturation and lightness window. The lightness ceilings are what separate a full-strength placeholder from a light tint (CMYK `0/50/0/0` lands at lightness 0.80 and is correctly ignored), and pixel sampling uses tighter windows than structured colour data so anti-aliasing and JPEG artefacts cannot promote a pink into a flag.
+The lightness ceilings are what separate a full-strength placeholder from a light tint: CMYK `0/50/0/0` renders at lightness 0.80 and is correctly ignored. Pixel sampling uses deliberately tighter windows than structured colour, because that path only runs when no layer or vector colour was found and BMW artwork is full of sunset photography whose pinks would otherwise read as placeholder copy.
+
+Finally, the flag is independent of the sample text. A subsetted font whose glyphs carry no usable character mapping decodes to nothing, but the artboard still has magenta text on it — so it is still flagged, with no quoted sample.
 
 ### Proprietary BMW Dictionary & Stemming Engine
 The spelling engine combines:
@@ -495,6 +508,15 @@ The spelling engine combines:
    - **Automotive & Finance**: `WLTP`, `NEDC`, `PHEV`, `BEV`, `MSRP`, `APR`, `OAC`, `BHP`, `Nm`.
 3. **Morphological Stemmer**:
    - Iterates through 40+ suffix patterns (`-ing`, `-tion`, `-ation`, `-ment`, `-ness`, `-able`, `-ous`, `-est`, `-ly`, `-ies`, `-ied`, `'s`, etc.) to match derived words back to root forms, virtually eliminating false positives on marketing language.
+4. **Non-Prose Masking**:
+   Dealer panels were the single largest source of false flags — they contain nothing but proper nouns, abbreviations, phone numbers and URLs, none of which any dictionary will contain. Before tokenising, the checker blanks out (rather than deletes, so character offsets and the quoted context stay accurate):
+   - **Contact lines** — any line holding a phone number, URL or email address.
+   - **Proper-name lines** — short label lines recognised by shape rather than by listing every Indian locality: at most five words, every word Title-Case or ALL-CAPS, at least one Title-Case, and no sentence-ending punctuation. A single lowercase word (`with`, `at`, `up`) marks the line as prose and keeps it checked, and an ALL-CAPS headline is never mistaken for a name.
+   - **Inline URLs and emails** inside otherwise ordinary prose.
+
+   Hyphens are also treated as separators rather than word characters, so `state-of-the-art` is checked part by part instead of being looked up whole, and a domain like `bmw-infinitycars` is never reported as one misspelled word.
+
+   The trade-off is deliberate: a short Title-Case line such as `Sheer Driving Pleasure` is read as a name and skipped. Those lines are brand lockups in practice, and a dealer panel spraying a dozen false flags across every report costs far more than the rare missed typo in one.
 
 ---
 
@@ -521,6 +543,12 @@ chmod +x electron/ocr-vision
 
 #### Q: The QR Links column is missing entirely.
 **A**: The column appears when the batch contains an Illustrator file, or when a QR code was decoded on any asset. A PSD-only or image-only batch with no QR codes hides it rather than showing an empty column.
+
+#### Q: Why are dealer names and localities not spell-checked?
+**A**: By design. Contact lines (anything with a phone number, URL or email) and short Title-Case label lines are treated as proper names and excluded before the dictionary is consulted — see **Non-Prose Masking** above. Marketing copy is unaffected: any line containing a lowercase word, or ending in sentence punctuation, is still checked in full.
+
+#### Q: I set text to #FF00FF but Default Values still shows a dash.
+**A**: Confirm the text is *text*, not outlines. Type that has been converted to outlines (Type ▸ Create Outlines) has no text objects left, so the vector check finds nothing and only the much stricter pixel fallback applies. Colour itself is not the issue — magenta is recognised in CMYK documents as well as RGB ones, including the ink mixes Illustrator produces when it converts `#FF00FF` through a CMYK working profile.
 
 #### Q: How do I reload the app during development without restarting Electron?
 **A**: Click the **Refresh App** button located in the top window drag bar or at the bottom of the sidebar, or press `Cmd + R` inside the window.

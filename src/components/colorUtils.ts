@@ -154,11 +154,20 @@ export function normalizeColorToRgb(color: unknown): RgbColor | null {
 /**
  * One accepted rendering of "100% magenta", expressed as an HSL window.
  *
- * A single window is not enough: the same magenta reaches us through different
- * colour pipelines. Photoshop and RGB Illustrator documents give us sRGB
- * #FF00FF (hue 300), but pdf.js converts DeviceCMYK 0/100/0/0 with the
- * calibrated profile PDF viewers use, landing on #FB3199 (hue 329) — so a
- * CMYK Illustrator master would otherwise never be flagged.
+ * A single window is not enough, because the same magenta reaches us through
+ * different colour pipelines:
+ *
+ *  - Photoshop text layers and RGB Illustrator documents give us sRGB #FF00FF
+ *    (hue 300).
+ *  - A CMYK Illustrator document does not. Typing #FF00FF into the colour
+ *    picker of a CMYK document makes Illustrator convert it through the working
+ *    profile, so what lands in the file is a magenta-dominant ink mix such as
+ *    0/100/0/0, 8/98/0/0 or 17/91/0/0 — and pdf.js then converts *that* back to
+ *    RGB with its DeviceCMYK approximation. Measured across that spread the
+ *    results land between hue 316 and 337 at saturations as low as 0.62.
+ *
+ * The lightness ceilings are what separate a full-strength magenta from a light
+ * tint: CMYK 0/50/0/0 renders at lightness 0.80 and must not be flagged.
  */
 export interface MagentaAnchor {
   label: string;
@@ -174,36 +183,36 @@ export interface MagentaAnchor {
 }
 
 /**
- * Anchors used for structured colour data — a PSD text layer's fillColor, or an
- * AI/PDF fill operator. Those values are exact, so we allow only enough drift to
- * absorb colour-space conversion.
- *
- * The lightness ceilings matter: they are what separates a full-strength
- * magenta from a light tint (CMYK 0/50/0/0 renders at lightness 0.80).
+ * Anchors for structured colour data — a PSD text layer's fillColor, or the
+ * fill pdf.js reports for an Illustrator object.
  */
 export const STRUCTURED_ANCHORS: MagentaAnchor[] = [
   {
     label: 'sRGB #FF00FF',
     hue: 300,
-    hueTolerance: 12,
-    minSaturation: 0.75,
+    hueTolerance: 14,
+    minSaturation: 0.7,
     minLightness: 0.3,
     maxLightness: 0.72,
   },
   {
-    label: 'DeviceCMYK 0/100/0/0',
-    hue: 329,
-    hueTolerance: 6,
-    minSaturation: 0.8,
-    minLightness: 0.5,
+    // Covers every CMYK magenta measured through pdf.js: 0/100/0/0 -> #FB3199,
+    // 17/91/0/0 -> #D341A0, 25/100/0/0 -> #C12D98, 0/100/20/0 -> #FD2F7F, and
+    // spot magenta with an RGB alternate -> #EB008C.
+    label: 'CMYK magenta (converted)',
+    hue: 327,
+    hueTolerance: 12,
+    minSaturation: 0.6,
+    minLightness: 0.4,
     maxLightness: 0.68,
   },
 ];
 
 /**
- * Anchors used when sampling rendered pixels. Anti-aliasing and JPEG artefacts
- * smear edges, so these are tighter — only near-pure magenta counts, which keeps
- * pinks and purples that legitimately appear in artwork out of the report.
+ * Anchors for sampled pixels. Deliberately tighter than the structured windows:
+ * this path only runs when no layer/vector colour was found, and BMW artwork is
+ * full of sunset photography whose pinks would otherwise be mistaken for
+ * placeholder copy.
  */
 export const PIXEL_ANCHORS: MagentaAnchor[] = [
   {
@@ -215,11 +224,11 @@ export const PIXEL_ANCHORS: MagentaAnchor[] = [
     maxLightness: 0.62,
   },
   {
-    label: 'DeviceCMYK 0/100/0/0',
-    hue: 329,
-    hueTolerance: 4,
-    minSaturation: 0.88,
-    minLightness: 0.54,
+    label: 'CMYK magenta (converted)',
+    hue: 328,
+    hueTolerance: 6,
+    minSaturation: 0.8,
+    minLightness: 0.45,
     maxLightness: 0.64,
   },
 ];
@@ -251,12 +260,46 @@ export function isMagentaRgb(
 }
 
 /**
+ * Is this ink mix magenta? Components are 0..1.
+ *
+ * When the original CMYK values survive — a raw AI/PDF content stream, a PSD
+ * text layer stored in CMYK — judge in ink space rather than converting to RGB
+ * first. "Magenta" then has an exact meaning (the magenta plate carries the
+ * colour and the others are near-empty) instead of depending on whichever
+ * CMYK-to-RGB approximation happens to be in play.
+ */
+export function isMagentaCmyk(c: number, m: number, y: number, k: number): boolean {
+  if (m < 0.75) return false;      // must be a strong magenta plate
+  if (y > 0.25) return false;      // yellow pushes it towards red
+  if (k > 0.25) return false;      // black pushes it towards maroon
+  if (c > 0.35) return false;      // cyan pushes it towards purple
+  // And magenta has to actually dominate the other plates.
+  return m - Math.max(c, y) >= 0.4;
+}
+
+/**
  * Is this colour (in any ag-psd colour shape) magenta?
+ *
+ * CMYK shapes are judged in ink space; everything else is normalised to RGB and
+ * tested against the anchors.
  */
 export function isMagentaColor(
   color: unknown,
   anchors: MagentaAnchor[] = STRUCTURED_ANCHORS
 ): boolean {
+  if (color && typeof color === 'object') {
+    const c = color as Record<string, number>;
+    if (
+      typeof c.c === 'number' &&
+      typeof c.m === 'number' &&
+      typeof c.y === 'number' &&
+      typeof c.k === 'number'
+    ) {
+      const scale = detectScale([c.c, c.m, c.y, c.k]);
+      return isMagentaCmyk(c.c / scale, c.m / scale, c.y / scale, c.k / scale);
+    }
+  }
+
   return isMagentaRgb(normalizeColorToRgb(color), anchors);
 }
 
