@@ -370,27 +370,28 @@ interface ReportViewProps {
 }
 
 function ReportView({ analyses, expandedRow, onExpandRow, onReset }: ReportViewProps) {
-  const isSingle = analyses.length === 1;
+  const count = analyses.length;
 
+  // Every delivery reports through the same table, whatever its size. A
+  // one-artboard file and a 75-artboard batch are read the same way, and the
+  // per-asset detail lives in the expandable row.
   return (
     <div className="qa-report">
       <div className="qa-report-header">
         <button className="btn-secondary" onClick={onReset}>
           ← New Analysis
         </button>
-        <h2>{isSingle ? 'Image QC Report' : `Batch QC Report — ${analyses.length} Images`}</h2>
+        <h2>
+          {count === 1 ? 'QC Report — 1 Image' : `Batch QC Report — ${count} Images`}
+        </h2>
         <OverallStatus analyses={analyses} />
       </div>
 
-      {isSingle ? (
-        <SingleImageReport analysis={analyses[0]} />
-      ) : (
-        <MultiImageReport
-          analyses={analyses}
-          expandedRow={expandedRow}
-          onExpandRow={onExpandRow}
-        />
-      )}
+      <MultiImageReport
+        analyses={analyses}
+        expandedRow={expandedRow}
+        onExpandRow={onExpandRow}
+      />
     </div>
   );
 }
@@ -422,133 +423,6 @@ function OverallStatus({ analyses }: { analyses: ImageAnalysis[] }) {
     <span className="qa-status-badge pass">
       ✅ {passed} Passed
     </span>
-  );
-}
-
-// ============================================
-// Single Image Report
-// ============================================
-
-function SingleImageReport({ analysis }: { analysis: ImageAnalysis }) {
-  const { metadata, ocrResult, spellingIssues, status, previewUrl } = analysis;
-
-  return (
-    <div className="qa-single-report">
-      {/* Left: Image Preview */}
-      <div className="qa-single-preview">
-        <div className="qa-preview-image-container">
-          <img src={previewUrl} alt={metadata.fileName} />
-        </div>
-      </div>
-
-      {/* Right: Details */}
-      <div className="qa-single-details">
-        {/* Dimensions & Specs Card */}
-        <div className="qa-spec-card qa-fade-in">
-          <h4>Dimensions & Specifications</h4>
-          <div className="qa-spec-grid">
-            <div className="qa-spec-item">
-              <span className="qa-spec-label">Width</span>
-              <span className="qa-spec-value large">{metadata.width}px</span>
-            </div>
-            <div className="qa-spec-item">
-              <span className="qa-spec-label">Height</span>
-              <span className="qa-spec-value large">{metadata.height}px</span>
-            </div>
-            <div className="qa-spec-item">
-              <span className="qa-spec-label">Aspect Ratio</span>
-              <span className="qa-spec-value">{metadata.aspectRatio}</span>
-            </div>
-            <div className="qa-spec-item">
-              <span className="qa-spec-label">Color Depth</span>
-              <span className="qa-spec-value">{metadata.colorDepth}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* File Format & Size Card */}
-        <div className="qa-spec-card qa-fade-in qa-stagger-1">
-          <h4>File Information</h4>
-          <div className="qa-spec-grid">
-            <div className="qa-spec-item">
-              <span className="qa-spec-label">Format</span>
-              <span className="qa-spec-value">{metadata.format}</span>
-            </div>
-            <div className="qa-spec-item">
-              <span className="qa-spec-label">File Size</span>
-              <span className="qa-spec-value">{metadata.fileSizeFormatted}</span>
-            </div>
-            <div className="qa-spec-item full-width">
-              <span className="qa-spec-label">File Name</span>
-              <span className="qa-spec-value">{metadata.fileName}</span>
-            </div>
-            <div className="qa-spec-item full-width">
-              <span className="qa-spec-label">Last Modified</span>
-              <span className="qa-spec-value">{metadata.lastModified}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* QR Links & Default Values */}
-        <div className="qa-spec-card qa-fade-in qa-stagger-2">
-          <h4>QR Links & Default Values</h4>
-          <div className="qa-spec-grid">
-            <div className="qa-spec-item full-width">
-              <span className="qa-spec-label">QR Links</span>
-              <QrLinksCell analysis={analysis} />
-            </div>
-            <div className="qa-spec-item full-width">
-              <span className="qa-spec-label">Default Values</span>
-              <DefaultValuesCell analysis={analysis} />
-            </div>
-          </div>
-          <QrLinkDetails links={analysis.qr.links} />
-          <DefaultValueSamples analysis={analysis} />
-        </div>
-
-        {/* Content & Spelling Analysis */}
-        <div className="qa-content-card qa-fade-in qa-stagger-3">
-          <h4>
-            Content & Spelling Analysis
-            <StatusBadge status={status} count={spellingIssues.length} />
-          </h4>
-
-          {/* OCR / Text Confidence */}
-          {ocrResult.text && (
-            <div className="qa-ocr-confidence">
-              <span className="qa-spec-label" style={{ minWidth: 70 }}>
-                {metadata.format.includes('PSD') || metadata.format.includes('AI')
-                  ? 'Text Confidence'
-                  : 'OCR Confidence'}
-              </span>
-              <div className="qa-confidence-bar">
-                <div
-                  className={`qa-confidence-fill ${
-                    ocrResult.confidence >= 80
-                      ? 'high'
-                      : ocrResult.confidence >= 50
-                      ? 'medium'
-                      : 'low'
-                  }`}
-                  style={{ width: `${ocrResult.confidence}%` }}
-                />
-              </div>
-              <span className="qa-confidence-label">
-                {Math.round(ocrResult.confidence)}%
-              </span>
-            </div>
-          )}
-
-          {/* Extracted Text */}
-          <div className={`qa-extracted-text ${!ocrResult.text ? 'empty' : ''}`}>
-            {ocrResult.text || 'No text detected in this image.'}
-          </div>
-
-          {/* Spelling Issues */}
-          <SpellingIssuesList issues={spellingIssues} />
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -968,9 +842,36 @@ const DEFAULT_VALUE_SOURCE: Record<DefaultValueCheck['method'], string> = {
   none: '',
 };
 
+const NEAR_MISS_SOURCE: Record<'layer' | 'vector' | 'pixel', string> = {
+  layer: 'the layer data',
+  vector: 'the vector artwork',
+  pixel: 'the rendered artwork',
+};
+
 function DefaultValueSamples({ analysis }: { analysis: ImageAnalysis }) {
-  const { hasMagenta, inText, samples, method } = analysis.defaultValues;
-  if (!hasMagenta) return null;
+  const { hasMagenta, inText, samples, method, nearest } = analysis.defaultValues;
+
+  // Nothing qualified, but something came close — say so. A bare dash leaves
+  // the reviewer unable to tell "no magenta here" from "magenta slightly off
+  // the mark", and those need very different follow-up.
+  if (!hasMagenta) {
+    if (!nearest) return null;
+    return (
+      <div className="qa-default-values near-miss">
+        <div className="qa-default-values-head">
+          <span
+            className="qa-magenta-swatch"
+            style={{ background: nearest.hex }}
+            aria-hidden="true"
+          />
+          <span>
+            No placeholder magenta. Closest colour in {NEAR_MISS_SOURCE[nearest.source]} is{' '}
+            <code>{nearest.hex}</code>.
+          </span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="qa-default-values">

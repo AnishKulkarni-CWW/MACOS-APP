@@ -205,15 +205,17 @@ An automated Quality Assurance powerhouse that checks design assets against BMW 
 7. **Default Value Detection** (`Default Values` column):
    - Flags any artboard where the BMW placeholder magenta — `#FF00FF` / `rgb(255, 0, 255)` / `cmyk(0, 100, 0, 0)` / `hsl(300, 100%, 50%)` — survives **anywhere in any layer**, not only on live type.
    - In Illustrator that means text fills and strokes, **outlined type**, filled and stroked paths, rules, swatches and logos. In Photoshop it means text-layer `fillColor` (including per-range style runs), shape and vector fills, strokes, layer effects, gradient stops and solid-colour fill layers.
-   - Reads the colour from the layer and vector data rather than guessing from pixels. Rendered pixels are sampled only as a fallback — for fully rasterised assets, and for gradients, whose colour pdf.js resolves through a separate pattern object.
+   - Reads the colour from the layer and vector data rather than guessing from pixels. Rendered pixels are sampled only as a fallback, for artwork whose colour cannot be read structurally.
+   - When nothing qualifies but something came close, the expanded row names the nearest colour found (e.g. *“No placeholder magenta. Closest colour in the vector artwork is `#D341A0`.”*) — a bare dash cannot distinguish “no magenta here” from “magenta slightly off the mark”, and those need different follow-up.
    - Reports **Default Text** when the magenta sits on type and **Default Value** when it survives only as artwork. Both are flagged, both are filterable; the distinction tells the reviewer where to look.
    - Works in **CMYK documents as well as RGB ones**. Typing `#FF00FF` into the colour picker of a CMYK Illustrator file makes Illustrator convert it through the working profile, so what is actually stored is a magenta-dominant ink mix (`0/100/0/0`, `8/98/0/0`, `17/91/0/0`, …) rather than the literal hex — all of which are recognised.
    - Flagging does not depend on being able to quote the copy: outlined type has no glyphs at all, and a subsetted font with no usable character mapping decodes to nothing. The artboard is still flagged, it simply reports no sample text.
    - Hidden layers and switched-off layer effects are excluded — they are not part of the delivered artwork.
    - Marked **✅ Default Text** when placeholder copy is present, or **—** when the artboard is clean. The expanded row lists the exact offending strings.
 8. **Interactive QC Reporting**:
-   - **Single Image Mode**: Technical specs (width, height, aspect ratio, color depth, file size), OCR confidence meter, full extracted copy, and itemized flagged issues with surrounding sentence context.
-   - **Batch Mode**: Top-level KPI metrics (Total Assets, Aggregate Size, Pass Count, Flagged Count), multi-column table, and collapsible preview drawers.
+   - **One table for every delivery.** A single artboard and a 75-artboard batch report through the same columns — File Name, Dimensions, Format & Size, QR Links, Default Values, Status — so nothing has to be read two different ways.
+   - Top-level KPI metrics (Total Assets, Aggregate Size, Pass Count, Flagged Count) above the table.
+   - Any row expands into a preview plus the full detail: technical specs, decoded QR links, placeholder copy, OCR confidence meter, extracted text, and itemized flagged issues with surrounding sentence context.
    - **Column Filters**: File-name search plus dropdown filters for Dimensions, Format, QR Links (working / broken / IN / non-IN / no QR), Default Values, and Status. Filters combine with AND, the KPI tiles follow the filtered set, and a single **Clear** resets everything.
 
 ---
@@ -492,18 +494,26 @@ Testing for `#FF00FF` literally does not work, because the placeholder rarely su
 - **Ink space, when the original CMYK survives** (a raw AI/PDF content stream, or a PSD text layer stored in CMYK). `isMagentaCmyk()` asks the question directly — the magenta plate is strong (M ≥ 0.75), the others are near-empty (C ≤ 0.35, Y ≤ 0.25, K ≤ 0.25) and magenta dominates them by a clear margin. No colour conversion is involved, so no approximation can distort the answer.
 - **HSL anchors, when only converted RGB is available.** Every other colour shape (RGB/RGBA, FRGB, HSB, Grayscale) is normalised to RGB and tested against anchors sized from the measured conversion spread:
 
-| Anchor | Covers | Window |
+| Window | Used for | Range |
 | :--- | :--- | :--- |
-| sRGB magenta | Photoshop text layers, RGB Illustrator documents | hue 300° ± 14°, S ≥ 0.70, L 0.30–0.72 |
-| CMYK magenta (converted) | Every CMYK ink mix above, plus spot magenta with an RGB alternate (`#EB008C`) | hue 327° ± 12°, S ≥ 0.60, L 0.40–0.68 |
+| **Magenta family** | Structured colour — PSD layers, Illustrator fills and strokes | hue 316° ± 28°, S ≥ 0.45, L 0.25–0.78 |
+| **Near-pure magenta** | Rendered pixels | hue 300° ± 10° (S ≥ 0.80) or hue 328° ± 8° (S ≥ 0.75), L 0.35–0.66 |
 
-The lightness ceilings are what separate a full-strength placeholder from a light tint: CMYK `0/50/0/0` renders at lightness 0.80 and is correctly ignored. Pixel sampling uses deliberately tighter windows than structured colour, because that path only runs when no layer or vector colour was found and BMW artwork is full of sunset photography whose pinks would otherwise read as placeholder copy.
+The structured window is deliberately generous. Colour read from layer or vector data was placed by a designer, and BMW's palette is blue, black, white and grey — so the realistic cost of a wide window is near zero, while missing a placeholder because a colour profile shifted it a few degrees is expensive. It still stops short of the neighbouring families: crimson (hue 348) is out, so are purples below saturation 0.45, and so is a light tint — CMYK `0/50/0/0` renders at lightness 0.80, above the ceiling, so a 50% tint is never mistaken for a full-strength placeholder.
+
+**The rendered-pixel pass cannot be that generous**, because BMW campaign photography — sunsets especially — lives in the same hue range. Colour alone therefore never decides it; a candidate must also prove itself *flat*:
+
+- Pixels in the magenta family are counted per exact RGB value.
+- A vector fill paints thousands of pixels of one identical value, with only anti-aliased edges around it. A photographic gradient spreads its pixels evenly across neighbouring values.
+- A value is accepted only when it stands well clear of every colour in the surrounding ±1 cube. (The whole cube, not one channel at a time — a ramp moves all three channels together, so a single-axis probe would find nothing beside it and wrongly call the band flat.)
+
+This is what lets a magenta price sitting on top of a sunset be flagged while the sunset itself is not. Its documented limit is that a *smooth magenta gradient* is continuous tone, not a flat fill, and is not flagged — the same property that keeps the photography out.
 
 **Magenta is searched for everywhere it can hide**, because a placeholder that survives as artwork is exactly as much of a delivery defect as one that survives as type:
 
 - *Illustrator* — the page's operator list is walked with a graphics-state stack, tracking both fill and stroke. This build of pdf.js does not emit `fill` / `stroke` as standalone operators; it folds them into `constructPath`, whose first argument is the paint operator's own code. Watching only `showText` therefore misses every filled and stroked path — which is exactly how outlined type, rules, swatches and logos are drawn in a press-ready file. Pattern fills clear the tracked colour rather than letting a stale one stand, and text set to an invisible rendering mode (`Tr 3`, `Tr 7`) is ignored.
 - *Photoshop* — every layer is scanned for colour records by shape rather than by a fixed list of properties, so a magenta text fill, shape fill, stroke, layer effect, gradient stop or solid-colour fill layer all surface the same way. Pixel data and children are skipped, as are hidden layers and effects marked `enabled: false`.
-- *Rendered pixels* — the fallback, kept tight, covering flattened rasters and gradients (pdf.js hands `shadingFill` only a pattern id, resolving the stops separately, so gradients cannot be read from the operator list).
+- *Rendered pixels* — the fallback, covering flattened rasters and type that a transparency flatten turned into an image. Gradients cannot be read from the operator list either (pdf.js hands `shadingFill` only a pattern id and resolves the stops separately), and a smooth gradient is out of scope for the pixel pass as described above.
 
 Finally, the flag is independent of the sample text. Outlined type has no glyphs, and a subsetted font whose glyphs carry no usable character mapping decodes to nothing — but the artboard still has magenta on it, so it is still flagged, with no quoted sample.
 
@@ -555,6 +565,9 @@ chmod +x electron/ocr-vision
 
 #### Q: Why are dealer names and localities not spell-checked?
 **A**: By design. Contact lines (anything with a phone number, URL or email) and short Title-Case label lines are treated as proper names and excluded before the dictionary is consulted — see **Non-Prose Masking** above. Marketing copy is unaffected: any line containing a lowercase word, or ending in sentence punctuation, is still checked in full.
+
+#### Q: Why does a single file still show as a table rather than a detail page?
+**A**: By design — every delivery reports through the same columns, so a one-artboard file and a 75-artboard batch are read the same way. Click the row to expand the preview and the full per-asset detail.
 
 #### Q: What is the difference between "Default Text" and "Default Value"?
 **A**: Both mean placeholder magenta survived into the delivery. **Default Text** means it is on live type; **Default Value** means it survives only as artwork — outlined type, a filled or stroked path, a shape fill, a layer effect or a gradient. Both are flagged and both match the *Default text* filter.

@@ -20,7 +20,12 @@
 // lists throw and every artboard comes back blank.
 import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import { inflate, inflateRaw } from 'pako';
-import { isMagentaCmyk, isMagentaRgb, type RgbColor } from './colorUtils';
+import {
+  isMagentaCmyk,
+  isMagentaRgb,
+  magentaProximity,
+  type RgbColor,
+} from './colorUtils';
 
 // ============================================
 // pdf.js bootstrap
@@ -64,6 +69,8 @@ export interface AiArtboard {
   hasMagenta: boolean;
   /** True when the magenta was used on type rather than only on artwork. */
   magentaInText: boolean;
+  /** Closest magenta-family colour painted, when nothing qualified. */
+  nearestMagenta: RgbColor | null;
 }
 
 // ============================================
@@ -170,6 +177,12 @@ export interface MagentaScan {
   inText: boolean;
   /** Readable samples of magenta copy, when the glyphs map back to characters. */
   samples: string[];
+  /**
+   * The closest magenta-family colour actually painted on the artboard when
+   * nothing qualified. Surfaced in the report so a near miss is explained
+   * rather than leaving the reviewer with an unexplained dash.
+   */
+  nearest: RgbColor | null;
 }
 
 /**
@@ -215,13 +228,25 @@ async function findMagentaOnPage(page: {
     opList = await page.getOperatorList();
   } catch (err) {
     console.warn('Could not read AI operator list for colour analysis:', err);
-    return { found: false, inText: false, samples: [] };
+    return { found: false, inText: false, samples: [], nearest: null };
   }
 
   const { fills, strokes, both } = buildPaintKinds(OPS);
   const samples: string[] = [];
   let found = false;
   let inText = false;
+  let nearest: RgbColor | null = null;
+  let nearestDistance = Infinity;
+
+  /** Remember how close a painted colour came, for the near-miss report. */
+  const noteNearMiss = (colour: RgbColor | null) => {
+    if (!colour) return;
+    const distance = magentaProximity(colour);
+    if (distance !== null && distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = colour;
+    }
+  };
 
   interface GraphicsState {
     fill: RgbColor | null;
@@ -293,7 +318,11 @@ async function findMagentaOnPage(page: {
       const isMagenta =
         (paintsFill && isMagentaRgb(state.fill)) ||
         (paintsStroke && isMagentaRgb(state.stroke));
-      if (!isMagenta) continue;
+      if (!isMagenta) {
+        if (paintsFill) noteNearMiss(state.fill);
+        if (paintsStroke) noteNearMiss(state.stroke);
+        continue;
+      }
 
       found = true;
       inText = true;
@@ -316,6 +345,9 @@ async function findMagentaOnPage(page: {
         (paintsStroke && isMagentaRgb(state.stroke))
       ) {
         found = true;
+      } else {
+        if (paintsFill) noteNearMiss(state.fill);
+        if (paintsStroke) noteNearMiss(state.stroke);
       }
       continue;
     }
@@ -335,7 +367,7 @@ async function findMagentaOnPage(page: {
     // cache. A magenta gradient is instead caught by the rendered-pixel pass.
   }
 
-  return { found, inText, samples: dedupe(samples) };
+  return { found, inText, samples: dedupe(samples), nearest };
 }
 
 function dedupe(values: string[]): string[] {
@@ -475,6 +507,7 @@ export async function processAiDocument(
       magentaTexts: magenta.samples,
       hasMagenta: magenta.found,
       magentaInText: magenta.inText,
+      nearestMagenta: magenta.nearest,
     });
 
     page.cleanup?.();
